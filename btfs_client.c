@@ -1,16 +1,17 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 #include <bluetooth/rfcomm.h>
+#include <bluetooth/sdp.h>
+#include <bluetooth/sdp_lib.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
-#include <stdlib.h>
 
-#define MAX_DEVICES 255
 #define RECONNECT_DELAY 5
 #define MAX_NAME_LEN 248
 
@@ -25,7 +26,119 @@ void print_timestamp() {
     printf("%s ", buffer);
 }
 
-int find_device(char *target_name, bdaddr_t *target_addr)
+// Поиск RFCOMM канала через SDP по UUID сервиса
+int sdp_search_rfcomm_channel(bdaddr_t *target, uuid_t *svc_uuid)
+{
+    sdp_list_t *response_list = NULL, *search_list, *attrid_list;
+    sdp_session_t *session = 0;
+    uint32_t range = 0x0000ffff;
+    uint8_t channel = 0;
+    int status;
+
+    print_timestamp();
+    printf("Starting SDP search on device...\n");
+
+    // Подключение к SDP серверу на удаленном устройстве
+    session = sdp_connect(BDADDR_ANY, target, SDP_RETRY_IF_BUSY);
+    if (!session) {
+        print_timestamp();
+        fprintf(stderr, "ERROR: Failed to connect to SDP server: %s\n", strerror(errno));
+        return -1;
+    }
+
+    print_timestamp();
+    printf("Connected to remote SDP server\n");
+
+    // Список UUID для поиска
+    search_list = sdp_list_append(NULL, svc_uuid);
+    
+    // Атрибуты, которые нас интересуют
+    attrid_list = sdp_list_append(NULL, &range);
+
+    // Выполнение поиска
+    print_timestamp();
+    printf("Searching for service...\n");
+    
+    status = sdp_service_search_attr_req(session, search_list,
+                                         SDP_ATTR_REQ_RANGE, attrid_list,
+                                         &response_list);
+
+    if (status < 0) {
+        print_timestamp();
+        fprintf(stderr, "ERROR: SDP search failed: %s\n", strerror(errno));
+        sdp_close(session);
+        return -1;
+    }
+
+    print_timestamp();
+    printf("SDP search completed, processing results...\n");
+
+    // Обработка результатов
+    sdp_list_t *r = response_list;
+    int found = 0;
+    
+    for (; r; r = r->next) {
+        sdp_record_t *rec = (sdp_record_t*) r->data;
+        sdp_list_t *proto_list;
+        
+        // Получить список протоколов
+        if (sdp_get_access_protos(rec, &proto_list) == 0) {
+            sdp_list_t *p = proto_list;
+            
+            // Пройти по протоколам
+            for (; p; p = p->next) {
+                sdp_list_t *pds = (sdp_list_t*)p->data;
+                
+                for (; pds; pds = pds->next) {
+                    sdp_data_t *d = (sdp_data_t*)pds->data;
+                    int proto = 0;
+                    
+                    for (; d; d = d->next) {
+                        switch (d->dtd) {
+                            case SDP_UUID16:
+                            case SDP_UUID32:
+                            case SDP_UUID128:
+                                proto = sdp_uuid_to_proto(&d->val.uuid);
+                                break;
+                            case SDP_UINT8:
+                                if (proto == RFCOMM_UUID) {
+                                    channel = d->val.uint8;
+                                    found = 1;
+                                    print_timestamp();
+                                    printf("Found RFCOMM channel: %d\n", channel);
+                                }
+                                break;
+                        }
+                    }
+                }
+            }
+            
+            sdp_list_foreach(proto_list, (sdp_list_func_t)sdp_list_free, NULL);
+            sdp_list_free(proto_list, NULL);
+        }
+        
+        sdp_record_free(rec);
+        
+        if (found)
+            break;
+    }
+
+    sdp_list_free(response_list, NULL);
+    sdp_list_free(search_list, NULL);
+    sdp_list_free(attrid_list, NULL);
+    sdp_close(session);
+
+    if (!found) {
+        print_timestamp();
+        printf("WARNING: Service not found via SDP\n");
+        return -1;
+    }
+
+    return channel;
+}
+
+// Поиск устройства по имени
+int find_device_by_name(char *target_name, bdaddr_t *target_addr)
 {
     inquiry_info *devices = NULL;
     int max_rsp, num_rsp;
@@ -58,12 +171,9 @@ int find_device(char *target_name, bdaddr_t *target_addr)
         perror("ERROR: hci_open_dev failed");
         return -1;
     }
-    
-    print_timestamp();
-    printf("HCI socket opened (fd=%d)\n", sock);
 
-    len = 8;  // inquiry duration: 1.28 * 8 = ~10 seconds
-    max_rsp = MAX_DEVICES;
+    len = 8;
+    max_rsp = 255;
     flags = IREQ_CACHE_FLUSH;
     devices = (inquiry_info*)malloc(max_rsp * sizeof(inquiry_info));
     
@@ -129,35 +239,6 @@ int find_device(char *target_name, bdaddr_t *target_addr)
     return found ? 0 : -1;
 }
 
-int auto_pair(bdaddr_t *bdaddr) {
-    int dev_id = hci_get_route(NULL);
-    int sock = hci_open_dev(dev_id);
-    
-    if (sock < 0) {
-        print_timestamp();
-        perror("WARNING: Failed to open HCI device for pairing");
-        return -1;
-    }
-    
-    print_timestamp();
-    printf("Attempting to authenticate link...\n");
-    
-    // Попытка создать аутентифицированное соединение
-    uint16_t handle;
-    if (hci_create_connection(sock, bdaddr, htobs(0xcc18), 0, 0, &handle, 25000) < 0) {
-        print_timestamp();
-        perror("WARNING: Authentication link failed");
-        close(sock);
-        return -1;
-    }
-    
-    print_timestamp();
-    printf("Authentication successful\n");
-    
-    close(sock);
-    return 0;
-}
-
 int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
 {
     struct sockaddr_rc addr = {0};
@@ -176,7 +257,6 @@ int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
     print_timestamp();
     printf("Creating RFCOMM socket...\n");
 
-    // Allocate socket
     s = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
     if (s < 0) {
         print_timestamp();
@@ -184,20 +264,9 @@ int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
         return -1;
     }
 
-    // Установить низкий уровень безопасности (без сопряжения)
-    int security_level = BT_SECURITY_LOW;
-    if (setsockopt(s, SOL_BLUETOOTH, BT_SECURITY, &security_level, sizeof(security_level)) < 0) {
-        print_timestamp();
-        perror("WARNING: Failed to set security level");
-    } else {
-        print_timestamp();
-        printf("Security level set to LOW\n");
-    }
-
     print_timestamp();
     printf("Socket created successfully (fd=%d)\n", s);
     
-    // Set connection parameters
     addr.rc_family = AF_BLUETOOTH;
     addr.rc_channel = channel;
     bacpy(&addr.rc_bdaddr, server_addr);
@@ -208,20 +277,15 @@ int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
     printf("  Remote address: %s\n", addr_str);
     print_timestamp();
     printf("  RFCOMM channel: %d\n", channel);
-    print_timestamp();
-    printf("  Protocol: RFCOMM\n");
     
     print_timestamp();
     printf("Attempting to connect...\n");
 
-    // Connect to server
     status = connect(s, (struct sockaddr *)&addr, sizeof(addr));
     
     if (status == 0) {
         print_timestamp();
         printf("*** CONNECTION ESTABLISHED ***\n");
-        print_timestamp();
-        printf("Connected to %s on channel %d\n", addr_str, channel);
         print_timestamp();
         printf("=================================================\n\n");
         return s;
@@ -242,24 +306,24 @@ int main(int argc, char **argv)
     int sock = -1;
     char buf[1024];
     int bytes_read, bytes_written;
-    char *target_device = "Yurik";  // Имя устройства-сервера
     char *server_mac = NULL;
-    uint8_t channel = 1;
+    char *target_device = "Yurik";
+    int channel = -1;
     int connection_count = 0;
-    int reconnect_attempts = 0;
+    
+    // UUID сервиса - соответствует тому, что в сервере
+    uint32_t service_uuid_int[] = {0x01110000, 0x00100000, 0x80000080, 0xFB349B5F};
+    uuid_t svc_uuid;
 
     print_timestamp();
     printf("#################################################\n");
     print_timestamp();
-    printf("BLUETOOTH RFCOMM CLIENT STARTING\n");
+    printf("BLUETOOTH RFCOMM CLIENT WITH SDP\n");
     print_timestamp();
     printf("#################################################\n\n");
 
-    // Parse command line arguments
     if (argc > 1) {
         server_mac = argv[1];
-        print_timestamp();
-        printf("Using MAC address from command line: %s\n", server_mac);
     }
     
     if (argc > 2) {
@@ -271,57 +335,54 @@ int main(int argc, char **argv)
     print_timestamp();
     printf("  Target device name: %s\n", target_device);
     print_timestamp();
-    printf("  RFCOMM channel: %d\n", channel);
-    print_timestamp();
     printf("  Reconnect delay: %d seconds\n", RECONNECT_DELAY);
     print_timestamp();
     printf("\n");
 
+    // Создать UUID для поиска
+    sdp_uuid128_create(&svc_uuid, &service_uuid_int);
+
     while (1) {
-        // Find and connect to server if not connected
         if (sock < 0) {
-            reconnect_attempts++;
-            
-            print_timestamp();
-            printf("Connection attempt #%d\n", reconnect_attempts);
-            
-            // If MAC address provided, use it directly
+            // Найти устройство
             if (server_mac) {
                 print_timestamp();
                 printf("Using provided MAC address: %s\n", server_mac);
                 str2ba(server_mac, &server_addr);
-                
-                // Попытка автоматического сопряжения (опционально)
-                // auto_pair(&server_addr);
-                
-                sock = connect_to_server(&server_addr, channel);
             } else {
-                // Otherwise, scan for device
-                if (find_device(target_device, &server_addr) == 0) {
-                    sock = connect_to_server(&server_addr, channel);
-                } else {
+                if (find_device_by_name(target_device, &server_addr) != 0) {
                     print_timestamp();
-                    printf("Device not found during scan\n");
+                    printf("Device not found. Retrying in %d seconds...\n", RECONNECT_DELAY);
+                    sleep(RECONNECT_DELAY);
+                    continue;
                 }
             }
+
+            // Поиск RFCOMM канала через SDP
+            channel = sdp_search_rfcomm_channel(&server_addr, &svc_uuid);
+            
+            if (channel < 0) {
+                print_timestamp();
+                printf("SDP search failed, trying default channel 1...\n");
+                channel = 1;
+            }
+
+            // Подключение
+            sock = connect_to_server(&server_addr, channel);
             
             if (sock < 0) {
                 print_timestamp();
                 printf("Failed to connect. Retrying in %d seconds...\n", RECONNECT_DELAY);
-                print_timestamp();
-                printf("\n");
                 sleep(RECONNECT_DELAY);
                 continue;
             }
             
             connection_count++;
-            reconnect_attempts = 0;
-            
             print_timestamp();
             printf("This is connection #%d\n\n", connection_count);
         }
 
-        // Send data
+        // Отправка данных
         char addr_str[18];
         ba2str(&server_addr, addr_str);
         
@@ -332,28 +393,18 @@ int main(int argc, char **argv)
         print_timestamp();
         printf("=================================================\n");
         
-        const char *message = "Hello from client!";
+        const char *message = "Hello from client with SDP!";
         print_timestamp();
         printf("Message: \"%s\"\n", message);
-        print_timestamp();
-        printf("Message length: %lu bytes\n", strlen(message));
-        print_timestamp();
-        printf("Target: %s\n", addr_str);
         
         bytes_written = write(sock, message, strlen(message));
         
         if (bytes_written < 0) {
             print_timestamp();
-            fprintf(stderr, "ERROR: Write failed: %s (errno=%d)\n", 
-                    strerror(errno), errno);
-            print_timestamp();
-            printf("Connection lost. Closing socket.\n");
+            fprintf(stderr, "ERROR: Write failed: %s\n", strerror(errno));
             close(sock);
             sock = -1;
-            print_timestamp();
-            printf("=================================================\n\n");
-            print_timestamp();
-            printf("Attempting to reconnect...\n\n");
+            channel = -1;
             sleep(RECONNECT_DELAY);
             continue;
         }
@@ -363,69 +414,12 @@ int main(int argc, char **argv)
         print_timestamp();
         printf("=================================================\n\n");
 
-        // Try to read response (optional)
-        print_timestamp();
-        printf("Waiting for response (with timeout)...\n");
-        
-        // Set socket timeout
-        struct timeval timeout;
-        timeout.tv_sec = 2;
-        timeout.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        
-        memset(buf, 0, sizeof(buf));
-        bytes_read = read(sock, buf, sizeof(buf));
-        
-        if (bytes_read > 0) {
-            print_timestamp();
-            printf("Received response: %d bytes\n", bytes_read);
-            print_timestamp();
-            printf("Data: [%s]\n", buf);
-        } else if (bytes_read == 0) {
-            print_timestamp();
-            printf("Server closed connection\n");
-            close(sock);
-            sock = -1;
-            print_timestamp();
-            printf("Attempting to reconnect...\n\n");
-            sleep(RECONNECT_DELAY);
-            continue;
-        } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                print_timestamp();
-                printf("No response (timeout)\n");
-            } else {
-                print_timestamp();
-                fprintf(stderr, "ERROR: Read failed: %s (errno=%d)\n", 
-                        strerror(errno), errno);
-                close(sock);
-                sock = -1;
-                print_timestamp();
-                printf("Connection lost. Attempting to reconnect...\n\n");
-                sleep(RECONNECT_DELAY);
-                continue;
-            }
-        }
-
-        print_timestamp();
-        printf("\n");
-        
-        // Wait before next iteration
-        print_timestamp();
-        printf("Waiting 5 seconds before next message...\n");
-        print_timestamp();
-        printf("\n");
         sleep(5);
     }
 
     if (sock >= 0) {
-        print_timestamp();
-        printf("Closing connection...\n");
         close(sock);
     }
-    
-    print_timestamp();
-    printf("Client terminated. Total connections: %d\n", connection_count);
     
     return 0;
 }
