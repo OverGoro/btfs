@@ -8,6 +8,7 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <stdlib.h>
 
 #define MAX_DEVICES 255
 #define RECONNECT_DELAY 5
@@ -67,7 +68,7 @@ int find_device(char *target_name, bdaddr_t *target_addr)
     devices = (inquiry_info*)malloc(max_rsp * sizeof(inquiry_info));
     
     print_timestamp();
-    printf("Starting inquiry scan (duration: ~%d seconds)...\n", len * 1.28);
+    printf("Starting inquiry scan (duration: ~%d seconds)...\n", (int)(len * 1.28));
     
     num_rsp = hci_inquiry(dev_id, len, max_rsp, NULL, &devices, flags);
     if (num_rsp < 0) {
@@ -128,6 +129,35 @@ int find_device(char *target_name, bdaddr_t *target_addr)
     return found ? 0 : -1;
 }
 
+int auto_pair(bdaddr_t *bdaddr) {
+    int dev_id = hci_get_route(NULL);
+    int sock = hci_open_dev(dev_id);
+    
+    if (sock < 0) {
+        print_timestamp();
+        perror("WARNING: Failed to open HCI device for pairing");
+        return -1;
+    }
+    
+    print_timestamp();
+    printf("Attempting to authenticate link...\n");
+    
+    // Попытка создать аутентифицированное соединение
+    uint16_t handle;
+    if (hci_create_connection(sock, bdaddr, htobs(0xcc18), 0, 0, &handle, 25000) < 0) {
+        print_timestamp();
+        perror("WARNING: Authentication link failed");
+        close(sock);
+        return -1;
+    }
+    
+    print_timestamp();
+    printf("Authentication successful\n");
+    
+    close(sock);
+    return 0;
+}
+
 int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
 {
     struct sockaddr_rc addr = {0};
@@ -154,9 +184,14 @@ int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
         return -1;
     }
 
+    // Установить низкий уровень безопасности (без сопряжения)
     int security_level = BT_SECURITY_LOW;
     if (setsockopt(s, SOL_BLUETOOTH, BT_SECURITY, &security_level, sizeof(security_level)) < 0) {
+        print_timestamp();
         perror("WARNING: Failed to set security level");
+    } else {
+        print_timestamp();
+        printf("Security level set to LOW\n");
     }
 
     print_timestamp();
@@ -255,6 +290,10 @@ int main(int argc, char **argv)
                 print_timestamp();
                 printf("Using provided MAC address: %s\n", server_mac);
                 str2ba(server_mac, &server_addr);
+                
+                // Попытка автоматического сопряжения (опционально)
+                // auto_pair(&server_addr);
+                
                 sock = connect_to_server(&server_addr, channel);
             } else {
                 // Otherwise, scan for device
