@@ -680,6 +680,60 @@ static struct inode *btfs_get_inode(struct super_block *sb,
     return inode;
 }
 
+// В функции btfs_fill_super нужно добавить парсинг mount options
+
+// Добавьте эту функцию перед btfs_fill_super:
+
+// Замените функцию btfs_parse_options на эту:
+
+static int btfs_parse_options(char *options, struct btfs_mount_opts *opts) {
+    char *p;
+    
+    if (!options || strlen(options) == 0) {
+        printk(KERN_ERR "btfs_server: No mount options provided\n");
+        return -EINVAL;
+    }
+    
+    // Простой парсинг вида backing_dir=/path
+    p = strstr(options, "backing_dir=");
+    if (!p) {
+        printk(KERN_ERR "btfs_server: backing_dir option not found\n");
+        return -EINVAL;
+    }
+    
+    p += 12; // длина "backing_dir="
+    
+    // Найти конец значения (запятая или конец строки)
+    char *end = strchr(p, ',');
+    size_t len;
+    
+    if (end) {
+        len = end - p;
+    } else {
+        len = strlen(p);
+    }
+    
+    if (len == 0) {
+        printk(KERN_ERR "btfs_server: Empty backing_dir value\n");
+        return -EINVAL;
+    }
+    
+    opts->backing_dir = kmalloc(len + 1, GFP_KERNEL);
+    if (!opts->backing_dir) {
+        return -ENOMEM;
+    }
+    
+    memcpy(opts->backing_dir, p, len);
+    opts->backing_dir[len] = '\0';
+    
+    printk(KERN_INFO "btfs_server: Parsed backing_dir=%s\n", opts->backing_dir);
+    
+    return 0;
+}
+
+
+// Измените btfs_fill_super:
+
 static int btfs_fill_super(struct super_block *sb, void *data, int silent) {
     struct btfs_fs_info *fsi;
     struct inode *root_inode;
@@ -693,15 +747,38 @@ static int btfs_fill_super(struct super_block *sb, void *data, int silent) {
     
     sb->s_fs_info = fsi;
     
-    fsi->mount_opts.backing_dir = kstrdup("/tmp/btfs_backing", GFP_KERNEL);
+    // Парсить опции
+    if (!data) {
+        printk(KERN_ERR "btfs_server: No mount options provided\n");
+        kfree(fsi);
+        return -EINVAL;
+    }
     
+    ret = btfs_parse_options((char *)data, &fsi->mount_opts);
+    if (ret < 0) {
+        printk(KERN_ERR "btfs_server: Failed to parse mount options\n");
+        kfree(fsi);
+        return ret;
+    }
+    
+    // Получить path к backing directory
     ret = kern_path(fsi->mount_opts.backing_dir, LOOKUP_FOLLOW, 
                     &fsi->backing_path);
     if (ret) {
-        printk(KERN_ERR "btfs_server: Invalid backing directory\n");
+        printk(KERN_ERR "btfs_server: Invalid backing directory: %s\n",
+               fsi->mount_opts.backing_dir);
         kfree(fsi->mount_opts.backing_dir);
         kfree(fsi);
         return ret;
+    }
+    
+    // Проверить что это директория
+    if (!d_is_dir(fsi->backing_path.dentry)) {
+        printk(KERN_ERR "btfs_server: backing_dir is not a directory\n");
+        path_put(&fsi->backing_path);
+        kfree(fsi->mount_opts.backing_dir);
+        kfree(fsi);
+        return -ENOTDIR;
     }
     
     sb->s_magic = BTFS_MAGIC;
