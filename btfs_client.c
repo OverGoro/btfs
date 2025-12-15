@@ -154,6 +154,11 @@ int connect_to_server(bdaddr_t *server_addr, uint8_t channel)
         return -1;
     }
 
+    int security_level = BT_SECURITY_LOW;
+    if (setsockopt(s, SOL_BLUETOOTH, BT_SECURITY, &security_level, sizeof(security_level)) < 0) {
+        perror("WARNING: Failed to set security level");
+    }
+
     print_timestamp();
     printf("Socket created successfully (fd=%d)\n", s);
     

@@ -139,6 +139,11 @@ int main(int argc, char **argv)
         perror("ERROR: Socket creation failed");
         return -1;
     }
+
+    int security_level = BT_SECURITY_LOW;
+    if (setsockopt(s, SOL_BLUETOOTH, BT_SECURITY, &security_level, sizeof(security_level)) < 0) {
+        perror("WARNING: Failed to set security level");
+    }
     
     print_timestamp();
     printf("RFCOMM socket created successfully (fd=%d)\n", s);
