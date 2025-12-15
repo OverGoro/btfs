@@ -1,56 +1,77 @@
-# Compiler and flags
+# BTFS Makefile
+
 CC = gcc
-CFLAGS = -Wall -Wextra -g
-LDFLAGS = -lbluetooth
+CFLAGS = -Wall -O2 -pthread
+LDFLAGS = -lbluetooth -pthread
+KDIR = /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 
-# Target executables
-SERVER = btfs_server
-CLIENT = btfs_client
+# Kernel modules
+obj-m += btfs_server_fs.o
+obj-m += btfs_client_fs.o
 
-# Source files
-SERVER_SRC = btfs_server.c
-CLIENT_SRC = btfs_client.c
+.PHONY: all clean build-server build-client load-server load-client \
+        start-server start-client stop-server stop-client \
+        unload-server unload-client
 
-# Object files
-SERVER_OBJ = $(SERVER_SRC:.c=.o)
-CLIENT_OBJ = $(CLIENT_SRC:.c=.o)
+# ============ СБОРКА ============
 
-# Default target: build both programs
-all: $(SERVER) $(CLIENT)
+all: build-server build-client
 
-# Build server
-$(SERVER): $(SERVER_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+build-server: btfs_server_daemon btfs_server_fs.ko
 
-# Build client
-$(CLIENT): $(CLIENT_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+build-client: btfs_client_daemon btfs_client_fs.ko
 
-# Compile .c files to .o files
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+btfs_server_daemon: btfs_server_daemon.c btfs_protocol.h
+	$(CC) $(CFLAGS) -o btfs_server_daemon btfs_server_daemon.c $(LDFLAGS)
 
-# Clean build artifacts
+btfs_client_daemon: btfs_client_daemon.c btfs_protocol.h
+	$(CC) $(CFLAGS) -o btfs_client_daemon btfs_client_daemon.c $(LDFLAGS)
+
+btfs_server_fs.ko: btfs_server_fs.c
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+btfs_client_fs.ko: btfs_client_fs.c
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+# ============ СЕРВЕР ============
+
+load-server: btfs_server_fs.ko
+	insmod btfs_server_fs.ko
+	mkdir -p /srv/btfs_shared /mnt/btfs_server
+	mount -t btfs_server -o backing_dir=/srv/btfs_shared none /mnt/btfs_server
+
+start-server: btfs_server_daemon
+	./btfs_server_daemon /srv/btfs_shared &
+
+stop-server:
+	-pkill -f btfs_server_daemon
+
+unload-server:
+	-umount /mnt/btfs_server
+	-rmmod btfs_server_fs
+
+# ============ КЛИЕНТ ============
+
+load-client: btfs_client_fs.ko
+	insmod btfs_client_fs.ko
+	mkdir -p /mnt/btfs_client
+	mount -t btfs none /mnt/btfs_client
+
+start-client: btfs_client_daemon
+	@if [ -z "$(MAC)" ]; then echo "Usage: make start-client MAC=XX:XX:XX:XX:XX:XX"; exit 1; fi
+	./btfs_client_daemon $(MAC) &
+
+stop-client:
+	-pkill -f btfs_client_daemon
+
+unload-client:
+	-umount /mnt/btfs_client
+	-rmmod btfs_client_fs
+
+# ============ ОЧИСТКА ============
+
 clean:
-	rm -f $(SERVER) $(CLIENT) *.o
-
-# Install targets (optional)
-install: all
-	install -m 755 $(SERVER) /usr/local/bin/
-	install -m 755 $(CLIENT) /usr/local/bin/
-
-# Uninstall (optional)
-uninstall:
-	rm -f /usr/local/bin/$(SERVER)
-	rm -f /usr/local/bin/$(CLIENT)
-
-# Build only server
-server: $(SERVER)
-
-# Build only client
-client: $(CLIENT)
-
-# Rebuild everything
-rebuild: clean all
-
-.PHONY: all clean install uninstall server client rebuild
+	rm -f btfs_server_daemon btfs_client_daemon
+	rm -f *.o .*.o *.ko *.mod.* *.mod .*.cmd Module.symvers modules.order
+	rm -rf .tmp_versions
