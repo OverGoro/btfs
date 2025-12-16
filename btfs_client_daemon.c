@@ -128,7 +128,6 @@ int send_bt_request(uint32_t opcode, uint32_t flags, const void *data,
     
     pthread_mutex_lock(&bt_mutex);
     
-    header.version = BTFS_PROTOCOL_VERSION;
     header.opcode = opcode;
     header.sequence = sequence_counter++;
     header.client_id = client_id;
