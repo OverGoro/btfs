@@ -89,7 +89,7 @@ typedef struct {
     uint64_t file_handle;
     uint64_t offset;
     uint32_t size;
-    char *data;
+    char data[0];
 } btfs_write_req_t;
 
 typedef struct {
