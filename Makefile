@@ -3,7 +3,7 @@ obj-m += btfs_client_fs.o btfs_server_fs.o
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-all: modules daemons
+all: daemons btfs_test_client
 
 modules:
 	make -C $(KERNEL_DIR) M=$(PWD) modules
@@ -12,9 +12,13 @@ daemons:
 	gcc -o btfs_client_daemon btfs_client_daemon.c -lbluetooth -lpthread
 	gcc -o btfs_server_daemon btfs_server_daemon.c -lbluetooth -lpthread
 
+
+btfs_test_client: btfs_test_client.c btfs_protocol.h
+	$(CC) $(CFLAGS) -o btfs_test_client btfs_test_client.c -lbluetooth -lpthread
+
 clean:
 	make -C $(KERNEL_DIR) M=$(PWD) clean
-	rm -f btfs_client_daemon btfs_server_daemon
+	rm -f btfs_client_daemon btfs_server_daemon btfs_test_client
 
 install_client:
 	insmod btfs_client_fs.ko
