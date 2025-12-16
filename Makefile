@@ -3,7 +3,7 @@ obj-m += btfs_client_fs.o btfs_server_fs.o
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-all: daemons btfs_test_client btfs_netlink_test
+all: daemons btfs_test_client btfs_netlink_test modules
 
 modules:
 	make -C $(KERNEL_DIR) M=$(PWD) modules
@@ -21,7 +21,7 @@ btfs_netlink_test: btfs_netlink_test.c btfs_protocol.h
 
 clean:
 	make -C $(KERNEL_DIR) M=$(PWD) clean
-	rm -f btfs_client_daemon btfs_server_daemon btfs_test_client
+	rm -f btfs_client_daemon btfs_server_daemon btfs_test_client btfs_netlink_test
 
 install_client:
 	insmod btfs_client_fs.ko
@@ -31,6 +31,5 @@ install_server:
 
 uninstall:
 	-rmmod btfs_client_fs
-	-rmmod btfs_server_fs
 
 .PHONY: all modules daemons clean install_client install_server uninstall
