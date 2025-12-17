@@ -1,4 +1,4 @@
-obj-m += btfs_client_fs.o btfs_server_fs.o
+obj-m += btfs_client_fs.o 
 
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
