@@ -185,11 +185,9 @@ int wait_for_response(uint32_t sequence, btfs_response_t *response,
 
 void *bt_receive_thread(void *arg) {
     btfs_response_t response;
-    char data_buffer[BTFS_MAX_DATA];
     
     print_log("BT receive thread started");
     
-    // Установить таймаут для read
     struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
     setsockopt(bt_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     
@@ -197,12 +195,8 @@ void *bt_receive_thread(void *arg) {
         ssize_t ret = read(bt_socket, &response, sizeof(response));
         
         if (ret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;  // Timeout - проверить running и продолжить
-            }
-            if (running) {
-                print_log("ERROR: Failed to read response header: %s", strerror(errno));
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (running) print_log("ERROR: Failed to read response header: %s", strerror(errno));
             break;
         }
         
@@ -216,17 +210,18 @@ void *bt_receive_thread(void *arg) {
             break;
         }
         
+        char *data_buffer = NULL;
         if (response.data_len > 0) {
-            if (response.data_len > sizeof(data_buffer)) {
-                print_log("ERROR: Response data too large: %u", response.data_len);
+            data_buffer = malloc(response.data_len);
+            if (!data_buffer) {
+                print_log("ERROR: Cannot allocate %u bytes for response", response.data_len);
                 break;
             }
             
             ret = read(bt_socket, data_buffer, response.data_len);
             if (ret != response.data_len) {
-                if (running) {
-                    print_log("ERROR: Failed to read response data");
-                }
+                if (running) print_log("ERROR: Failed to read response data");
+                free(data_buffer);
                 break;
             }
         }
@@ -235,8 +230,13 @@ void *bt_receive_thread(void *arg) {
         if (req) {
             pthread_mutex_lock(&req->mutex);
             memcpy(&req->response, &response, sizeof(response));
-            if (response.data_len > 0) {
+            if (response.data_len > 0 && response.data_len <= BTFS_MAX_DATA) {
                 memcpy(req->response_data, data_buffer, response.data_len);
+            } else if (response.data_len > BTFS_MAX_DATA) {
+                print_log("WARNING: Response too large (%u bytes), truncating to %d", 
+                         response.data_len, BTFS_MAX_DATA);
+                memcpy(req->response_data, data_buffer, BTFS_MAX_DATA);
+                req->response.data_len = BTFS_MAX_DATA;
             }
             req->completed = 1;
             pthread_cond_signal(&req->cond);
@@ -244,11 +244,14 @@ void *bt_receive_thread(void *arg) {
         } else {
             print_log("WARNING: Response for unknown sequence: %u", response.sequence);
         }
+        
+        if (data_buffer) free(data_buffer);
     }
     
     print_log("BT receive thread stopped");
     return NULL;
 }
+
 
 // ============ NETLINK COMMUNICATION ============
 
