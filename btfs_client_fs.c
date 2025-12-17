@@ -329,45 +329,50 @@ static int btfs_release(struct inode *i, struct file *f)
     uint32_t seq;
     int32_t res;
     int ret;
-    
+
     if (!info->fh)
         return 0;
-    
+
     req.file_handle = info->fh;
     ret = send_nl(BTFS_OP_CLOSE, &req, sizeof(uint64_t), &seq);
-    if (ret < 0) {
-        info->fh = 0;  // Очистить даже при ошибке
+    if (ret < 0)
+    {
+        info->fh = 0; // Очистить даже при ошибке
         return ret;
     }
-    
-    if (!create_pend(seq)) {
+
+    if (!create_pend(seq))
+    {
         info->fh = 0;
         return -ENOMEM;
     }
-    
+
     ret = wait_resp(seq, &res, NULL, 0);
-    info->fh = 0;  // ВАЖНО: всегда очищать handle
-    
+    info->fh = 0; // ВАЖНО: всегда очищать handle
+
     return ret < 0 ? ret : (res < 0 ? res : 0);
 }
 
 static void btfs_evict_inode(struct inode *inode)
 {
     struct btfs_inode_info *info = BTFS_I(inode);
-    
+
     truncate_inode_pages_final(&inode->i_data);
     clear_inode(inode);
-    
+
     // Если есть открытый handle - закрыть принудительно
-    if (info->fh) {
+    if (info->fh)
+    {
         pr_warn("btfs: Force closing file handle %llu\n", info->fh);
         btfs_rw_req_t req;
         uint32_t seq;
         int32_t res;
-        
+
         req.file_handle = info->fh;
-        if (send_nl(BTFS_OP_CLOSE, &req, sizeof(uint64_t), &seq) == 0) {
-            if (create_pend(seq)) {
+        if (send_nl(BTFS_OP_CLOSE, &req, sizeof(uint64_t), &seq) == 0)
+        {
+            if (create_pend(seq))
+            {
                 wait_resp(seq, &res, NULL, 0);
             }
         }
@@ -385,46 +390,79 @@ static ssize_t btfs_read(struct file *f, char __user *buf, size_t len, loff_t *o
     uint32_t seq;
     int32_t res;
     int ret;
-    ssize_t bytes;
+    ssize_t total_read = 0;
+
     if (!info->fh)
     {
         ret = btfs_open(i, f);
         if (ret < 0)
             return ret;
     }
-    req.file_handle = info->fh;
-    req.offset = *off;
-    req.size = len;
-    ret = send_nl(BTFS_OP_READ, &req, sizeof(req), &seq);
-    if (ret < 0)
-        return ret;
-    if (!create_pend(seq))
-        return -ENOMEM;
-    rbuf = kmalloc(sizeof(btfs_read_resp_t) + len, GFP_KERNEL);
-    if (!rbuf)
+
+    // ИСПРАВЛЕНИЕ: читать циклом, пока не прочитаем всё запрошенное или EOF
+    while (len > 0)
     {
-        remove_pend(seq);
-        return -ENOMEM;
-    }
-    ret = wait_resp(seq, &res, rbuf, sizeof(btfs_read_resp_t) + len);
-    if (ret < 0 || res < 0)
-    {
-        kfree(rbuf);
-        return ret < 0 ? ret : res;
-    }
-    resp = (btfs_read_resp_t *)rbuf;
-    bytes = resp->bytes_read;
-    if (bytes > 0)
-    {
-        if (copy_to_user(buf, resp->data, bytes))
+        // Ограничить размер одного запроса
+        uint32_t chunk_size = (len > 4000) ? 4000 : len;
+
+        req.file_handle = info->fh;
+        req.offset = *off;
+        req.size = chunk_size;
+
+        ret = send_nl(BTFS_OP_READ, &req, sizeof(req), &seq);
+        if (ret < 0)
+            return total_read > 0 ? total_read : ret;
+
+        if (!create_pend(seq))
+            return total_read > 0 ? total_read : -ENOMEM;
+
+        rbuf = kmalloc(sizeof(btfs_read_resp_t) + chunk_size, GFP_KERNEL);
+        if (!rbuf)
+        {
+            remove_pend(seq);
+            return total_read > 0 ? total_read : -ENOMEM;
+        }
+
+        ret = wait_resp(seq, &res, rbuf, sizeof(btfs_read_resp_t) + chunk_size);
+        if (ret < 0 || res < 0)
         {
             kfree(rbuf);
-            return -EFAULT;
+            return total_read > 0 ? total_read : (ret < 0 ? ret : res);
         }
-        *off += bytes;
+
+        resp = (btfs_read_resp_t *)rbuf;
+        ssize_t bytes = resp->bytes_read;
+
+        if (bytes > 0)
+        {
+            if (copy_to_user(buf + total_read, resp->data, bytes))
+            {
+                kfree(rbuf);
+                return total_read > 0 ? total_read : -EFAULT;
+            }
+
+            total_read += bytes;
+            *off += bytes;
+            len -= bytes;
+
+            // Если прочитали меньше, чем запросили - достигли EOF
+            if (bytes < chunk_size)
+            {
+                kfree(rbuf);
+                break;
+            }
+        }
+        else
+        {
+            // EOF или ошибка
+            kfree(rbuf);
+            break;
+        }
+
+        kfree(rbuf);
     }
-    kfree(rbuf);
-    return bytes;
+
+    return total_read;
 }
 
 static ssize_t btfs_write(struct file *f, const char __user *buf, size_t len, loff_t *off)
@@ -771,10 +809,9 @@ static void btfs_free_inode(struct inode *i) { kmem_cache_free(inode_cache, BTFS
 static const struct super_operations btfs_super_ops = {
     .alloc_inode = btfs_alloc_inode,
     .free_inode = btfs_free_inode,
-    .evict_inode = btfs_evict_inode,  // ДОБАВИТЬ
+    .evict_inode = btfs_evict_inode, // ДОБАВИТЬ
     .statfs = simple_statfs,
-    .drop_inode = generic_delete_inode
-};
+    .drop_inode = generic_delete_inode};
 
 static struct inode *btfs_make_inode(struct super_block *sb, umode_t mode)
 {
@@ -866,41 +903,45 @@ static int __init btfs_init(void)
 static void __exit btfs_exit(void)
 {
     pending_t *p;
-    
+
     unregister_filesystem(&btfs_fs);
-    
+
     // Сначала разбудить все ожидающие запросы
     mutex_lock(&pend_mtx);
     p = pend_head;
-    while (p) {
+    while (p)
+    {
         p->done = 1;
         p->res = -EINTR;
         wake_up_interruptible(&p->wait);
         p = p->next;
     }
     mutex_unlock(&pend_mtx);
-    
+
     // Подождать завершения операций
     msleep(100);
-    
+
     // Теперь освободить память
     mutex_lock(&pend_mtx);
     p = pend_head;
-    while (p) {
+    while (p)
+    {
         pending_t *n = p->next;
-        if (p->data) kfree(p->data);
+        if (p->data)
+            kfree(p->data);
         kfree(p);
         p = n;
     }
     pend_head = NULL;
     mutex_unlock(&pend_mtx);
-    
-    if (nl_sock) netlink_kernel_release(nl_sock);
-    if (inode_cache) kmem_cache_destroy(inode_cache);
-    
+
+    if (nl_sock)
+        netlink_kernel_release(nl_sock);
+    if (inode_cache)
+        kmem_cache_destroy(inode_cache);
+
     pr_info("btfs: Unloaded\n");
 }
-
 
 module_init(btfs_init);
 module_exit(btfs_exit);

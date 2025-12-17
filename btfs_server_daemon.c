@@ -538,9 +538,8 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
     void *response_data = NULL;
     uint32_t response_len = 0;
     char buffer[BTFS_MAX_DATA];
-    
     client->last_activity = time(NULL);
-    
+
     switch (header->opcode) {
         case BTFS_OP_GETATTR: {
             btfs_getattr_req_t *req = (btfs_getattr_req_t*)data;
@@ -585,8 +584,15 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
         
         case BTFS_OP_READ: {
             btfs_read_req_t *req = (btfs_read_req_t*)data;
+            
+            // ИСПРАВЛЕНИЕ: ограничить размер чтения
+            uint32_t max_read = BTFS_MAX_DATA - sizeof(btfs_read_resp_t);
+            uint32_t read_size = req->size > max_read ? max_read : req->size;
+            
             btfs_read_resp_t *resp = (btfs_read_resp_t*)buffer;
-            ssize_t bytes = handle_read(client->client_id, req->file_handle, req->offset, req->size, resp->data);
+            ssize_t bytes = handle_read(client->client_id, req->file_handle, 
+                                       req->offset, read_size, resp->data);
+            
             if (bytes >= 0) {
                 resp->bytes_read = bytes;
                 response_data = resp;
@@ -594,14 +600,23 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
             } else {
                 result = bytes;
             }
-            print_log("[Client %u] READ: handle=%lu -> %zd bytes", client->client_id, req->file_handle, bytes);
+            
+            print_log("[Client %u] READ: handle=%lu, offset=%lu, requested=%u, read=%zd", 
+                     client->client_id, req->file_handle, req->offset, req->size, bytes);
             break;
         }
         
         case BTFS_OP_WRITE: {
             btfs_write_req_t *req = (btfs_write_req_t*)data;
             btfs_write_resp_t resp;
-            ssize_t bytes = handle_write(client->client_id, req->file_handle, req->offset, req->data, req->size);
+            
+            // ИСПРАВЛЕНИЕ: ограничить размер записи
+            uint32_t max_write = BTFS_MAX_DATA - sizeof(btfs_write_req_t);
+            uint32_t write_size = req->size > max_write ? max_write : req->size;
+            
+            ssize_t bytes = handle_write(client->client_id, req->file_handle, 
+                                        req->offset, req->data, write_size);
+            
             if (bytes >= 0) {
                 resp.bytes_written = bytes;
                 response_data = &resp;
@@ -609,7 +624,9 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
             } else {
                 result = bytes;
             }
-            print_log("[Client %u] WRITE: handle=%lu -> %zd bytes", client->client_id, req->file_handle, bytes);
+            
+            print_log("[Client %u] WRITE: handle=%lu, offset=%lu, requested=%u, written=%zd", 
+                     client->client_id, req->file_handle, req->offset, req->size, bytes);
             break;
         }
         
@@ -655,6 +672,14 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
             break;
         }
         
+        case BTFS_OP_TRUNCATE: {
+            btfs_truncate_req_t *req = (btfs_truncate_req_t*)data;
+            result = handle_truncate(req->path, req->size);
+            print_log("[Client %u] TRUNCATE: %s -> size=%lu, result=%d", 
+                     client->client_id, req->path, req->size, result);
+            break;
+        }
+        
         case BTFS_OP_LOCK: {
             btfs_lock_req_t *req = (btfs_lock_req_t*)data;
             btfs_lock_resp_t resp;
@@ -679,7 +704,6 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
             file_lock_t *lock = find_lock(req->path, client->client_id);
             uint32_t lock_id = lock ? lock->lock_id : 0;
             pthread_mutex_unlock(&locks_mutex);
-            
             result = lock_id > 0 ? release_lock(lock_id, client->client_id) : -ENOENT;
             print_log("[Client %u] UNLOCK: %s -> %d", client->client_id, req->path, result);
             break;
@@ -689,7 +713,7 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
             result = 0;
             print_log("[Client %u] PING", client->client_id);
             break;
-        
+            
         default:
             result = -ENOSYS;
             print_log("[Client %u] UNKNOWN OPCODE: %u", client->client_id, header->opcode);
@@ -698,6 +722,7 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data) {
     
     send_response(client->socket, header->sequence, header->opcode, result, response_data, response_len);
 }
+
 
 // ============ КЛИЕНТСКИЙ ПОТОК ============
 
