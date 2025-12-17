@@ -710,7 +710,8 @@ void *client_thread(void *arg) {
     ba2str(&client->addr.rc_bdaddr, addr_str);
     print_log("[Client %u] Thread started: %s", client->client_id, addr_str);
     
-    struct timeval timeout = { .tv_sec = 30, .tv_usec = 0 };
+    // Установить таймаут для read
+    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(client->socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     
     while (server_running && client->active) {
@@ -718,12 +719,14 @@ void *client_thread(void *arg) {
         
         if (ret < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Timeout - проверить неактивность
                 if (time(NULL) - client->last_activity > 60) {
                     print_log("[Client %u] Timeout - closing connection", client->client_id);
                     break;
                 }
                 continue;
             }
+            
             print_log("[Client %u] Read error: %s", client->client_id, strerror(errno));
             break;
         }
@@ -736,10 +739,11 @@ void *client_thread(void *arg) {
     release_client_locks(client->client_id);
     close(client->socket);
     client->active = 0;
-    print_log("[Client %u] Thread finished", client->client_id);
     
+    print_log("[Client %u] Thread finished", client->client_id);
     return NULL;
 }
+
 
 // ============ SDP ============
 
@@ -872,12 +876,20 @@ int main(int argc, char **argv) {
     print_log("Server listening on RFCOMM channel 1");
     print_log("===================================================\n");
     
-    while (server_running) {
+     while (server_running) {
         struct sockaddr_rc rem_addr = {0};
         socklen_t opt = sizeof(rem_addr);
         
+        // Установить таймаут для accept
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+        setsockopt(server_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        
         int client_sock = accept(server_sock, (struct sockaddr*)&rem_addr, &opt);
+        
         if (client_sock < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;  // Timeout - проверить server_running
+            }
             if (server_running) perror("Accept failed");
             continue;
         }
@@ -927,13 +939,18 @@ int main(int argc, char **argv) {
     close(server_sock);
     if (sdp) sdp_close(sdp);
     
+    // Закрыть все клиентские соединения
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].active) close(clients[i].socket);
+        if (clients[i].active) {
+            close(clients[i].socket);
+            clients[i].active = 0;
+        }
     }
     
+    // Подождать завершения потоков (максимум 3 секунды)
     sleep(2);
-    free(base_path);
     
+    free(base_path);
     print_log("Server stopped");
     print_log("===================================================");
     

@@ -189,12 +189,30 @@ void *bt_receive_thread(void *arg) {
     
     print_log("BT receive thread started");
     
+    // Установить таймаут для read
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(bt_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     while (running) {
         ssize_t ret = read(bt_socket, &response, sizeof(response));
-        if (ret != sizeof(response)) {
-            if (running) {
-                print_log("ERROR: Failed to read response header");
+        
+        if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;  // Timeout - проверить running и продолжить
             }
+            if (running) {
+                print_log("ERROR: Failed to read response header: %s", strerror(errno));
+            }
+            break;
+        }
+        
+        if (ret == 0) {
+            print_log("Server closed connection");
+            break;
+        }
+        
+        if (ret != sizeof(response)) {
+            print_log("ERROR: Partial read of response header");
             break;
         }
         
@@ -206,7 +224,9 @@ void *bt_receive_thread(void *arg) {
             
             ret = read(bt_socket, data_buffer, response.data_len);
             if (ret != response.data_len) {
-                print_log("ERROR: Failed to read response data");
+                if (running) {
+                    print_log("ERROR: Failed to read response data");
+                }
                 break;
             }
         }
@@ -341,6 +361,10 @@ void *netlink_thread(void *arg) {
     
     print_log("Netlink thread started");
     
+    // Установить таймаут для recvmsg
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(nl_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
     nlh = (struct nlmsghdr *)buffer;
     
     while (running) {
@@ -355,7 +379,11 @@ void *netlink_thread(void *arg) {
         msg.msg_iovlen = 1;
         
         ssize_t ret = recvmsg(nl_socket, &msg, 0);
+        
         if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;  // Timeout - проверить running и продолжить
+            }
             if (running) {
                 perror("Netlink recvmsg");
             }
@@ -406,6 +434,7 @@ void *netlink_thread(void *arg) {
     print_log("Netlink thread stopped");
     return NULL;
 }
+
 
 // ============ SERVER CONNECTION ============
 
