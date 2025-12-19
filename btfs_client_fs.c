@@ -475,8 +475,18 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	ssize_t total = 0;
 	int ret;
 	
-	if (!bf)
-		return -EBADF;
+	/* ИСПРАВЛЕНО: если нет private_data - сначала открыть файл */
+	if (!bf) {
+		pr_info("btfs_read_iter: no private_data, calling open\n");
+		ret = btfs_open(inode, file);
+		if (ret < 0) {
+			pr_err("btfs_read_iter: open failed %d\n", ret);
+			return ret;
+		}
+		bf = file->private_data;
+		if (!bf)
+			return -EBADF;
+	}
 	
 	rbuf = kmalloc(sizeof(*rsp) + PAGE_SIZE, GFP_KERNEL);
 	if (!rbuf)
@@ -518,6 +528,7 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return total;
 }
 
+
 static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -531,8 +542,17 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	size_t max_chunk = PAGE_SIZE;
 	int ret;
 	
-	if (!bf)
-		return -EBADF;
+	if (!bf) {
+		pr_info("btfs_write_iter: no private_data, calling open\n");
+		ret = btfs_open(inode, file);
+		if (ret < 0) {
+			pr_err("btfs_write_iter: open failed %d\n", ret);
+			return ret;
+		}
+		bf = file->private_data;
+		if (!bf)
+			return -EBADF;
+	}
 	
 	if (count > max_chunk)
 		count = max_chunk;
@@ -550,11 +570,16 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return -EFAULT;
 	}
 	
+	pr_info("btfs_write_iter: handle=%llu offset=%lld size=%zu\n",
+		bf->fh, pos, count);
+	
 	ret = btfs_rpc(mnt, BTFS_OP_WRITE, wreq, sizeof(*wreq) + count, &wrsp, sizeof(wrsp));
 	kfree(wreq);
 	
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("btfs_write_iter: RPC failed %d\n", ret);
 		return ret;
+	}
 	
 	iocb->ki_pos = pos + wrsp.bytes_written;
 	if (iocb->ki_pos > i_size_read(inode))
@@ -562,6 +587,7 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	
 	return wrsp.bytes_written;
 }
+
 
 static int btfs_readdir(struct file *file, struct dir_context *ctx)
 {
