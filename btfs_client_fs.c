@@ -396,47 +396,76 @@ static struct inode *btfs_new_inode(struct super_block *sb, struct btfs_attr *fa
 /*
  * File operations
  */
-static int btfs_open(struct inode *inode, struct file *file)
+
+ static int btfs_ensure_open(struct inode *inode, struct file *file)
 {
 	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_file *bf;
+	struct btfs_file *bf = file->private_data;
 	struct btfs_open_req req;
 	struct btfs_open_resp rsp;
 	int ret;
 	
-	bf = kzalloc(sizeof(*bf), GFP_KERNEL);
-	if (!bf)
-		return -ENOMEM;
+	/* Уже открыт */
+	if (bf && bf->fh != 0)
+		return 0;
 	
+	pr_info("btfs: lazy open for inode %lu\n", inode->i_ino);
+	
+	/* Если bf не существует - создать */
+	if (!bf) {
+		bf = kzalloc(sizeof(*bf), GFP_KERNEL);
+		if (!bf)
+			return -ENOMEM;
+		file->private_data = bf;
+	}
+	
+	/* Вызвать OPEN RPC */
 	memset(&req, 0, sizeof(req));
 	ret = btfs_path(file->f_path.dentry, req.path, BTFS_MAX_PATH);
 	if (ret) {
 		kfree(bf);
+		file->private_data = NULL;
 		return ret;
 	}
 	
-	/* Правильная обработка флагов */
-	req.flags = file->f_flags & (O_RDONLY|O_WRONLY|O_RDWR|O_APPEND|O_TRUNC|O_CREAT);
+	/* Определить флаги из file->f_mode */
+	req.flags = 0;
+	if (file->f_mode & FMODE_READ)
+		req.flags |= O_RDONLY;
+	if (file->f_mode & FMODE_WRITE) {
+		if (file->f_mode & FMODE_READ)
+			req.flags = O_RDWR;
+		else
+			req.flags = O_WRONLY;
+	}
+	
 	req.mode = 0;
 	req.lock_type = 0;
 	
-	pr_info("btfs_open: path='%s' flags=0x%x f_flags=0x%x\n",
-		req.path, req.flags, file->f_flags);
+	pr_info("btfs_ensure_open: path='%s' f_mode=0x%x req.flags=0x%x\n",
+		req.path, file->f_mode, req.flags);
 	
 	ret = btfs_rpc(mnt, BTFS_OP_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
 	if (ret < 0) {
-		pr_err("btfs_open: RPC failed %d\n", ret);
+		pr_err("btfs_ensure_open: RPC failed %d\n", ret);
 		kfree(bf);
+		file->private_data = NULL;
 		return ret;
 	}
 	
 	bf->fh = rsp.file_handle;
-	file->private_data = bf;
 	
-	pr_info("btfs_open: success handle=%llu\n", bf->fh);
+	pr_info("btfs_ensure_open: success handle=%llu\n", bf->fh);
 	
 	return 0;
 }
+
+static int btfs_open(struct inode *inode, struct file *file)
+{
+	/* Просто используем ensure_open */
+	return btfs_ensure_open(inode, file);
+}
+
 
 static int btfs_release(struct inode *inode, struct file *file)
 {
@@ -466,7 +495,7 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_file *bf = file->private_data;
+	struct btfs_file *bf;
 	struct btfs_read_req req;
 	struct btfs_read_resp *rsp;
 	char *rbuf;
@@ -475,18 +504,13 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	ssize_t total = 0;
 	int ret;
 	
-	/* ИСПРАВЛЕНО: если нет private_data - сначала открыть файл */
-	if (!bf) {
-		pr_info("btfs_read_iter: no private_data, calling open\n");
-		ret = btfs_open(inode, file);
-		if (ret < 0) {
-			pr_err("btfs_read_iter: open failed %d\n", ret);
-			return ret;
-		}
-		bf = file->private_data;
-		if (!bf)
-			return -EBADF;
-	}
+	ret = btfs_ensure_open(inode, file);
+	if (ret < 0)
+		return ret;
+	
+	bf = file->private_data;
+	if (!bf || bf->fh == 0)
+		return -EBADF;
 	
 	rbuf = kmalloc(sizeof(*rsp) + PAGE_SIZE, GFP_KERNEL);
 	if (!rbuf)
@@ -499,8 +523,12 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		req.offset = pos;
 		req.size = chunk;
 		
+		pr_info("btfs_read_iter: handle=%llu offset=%lld size=%zu\n",
+			bf->fh, pos, chunk);
+		
 		ret = btfs_rpc(mnt, BTFS_OP_READ, &req, sizeof(req), rbuf, sizeof(*rsp) + chunk);
 		if (ret < 0) {
+			pr_err("btfs_read_iter: RPC failed %d\n", ret);
 			kfree(rbuf);
 			return total ? total : ret;
 		}
@@ -528,13 +556,12 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return total;
 }
 
-
 static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_file *bf = file->private_data;
+	struct btfs_file *bf;
 	struct btfs_write_req *wreq;
 	struct btfs_write_resp wrsp;
 	size_t count = iov_iter_count(from);
@@ -542,17 +569,13 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	size_t max_chunk = PAGE_SIZE;
 	int ret;
 	
-	if (!bf) {
-		pr_info("btfs_write_iter: no private_data, calling open\n");
-		ret = btfs_open(inode, file);
-		if (ret < 0) {
-			pr_err("btfs_write_iter: open failed %d\n", ret);
-			return ret;
-		}
-		bf = file->private_data;
-		if (!bf)
-			return -EBADF;
-	}
+	ret = btfs_ensure_open(inode, file);
+	if (ret < 0)
+		return ret;
+	
+	bf = file->private_data;
+	if (!bf || bf->fh == 0)
+		return -EBADF;
 	
 	if (count > max_chunk)
 		count = max_chunk;
@@ -585,9 +608,10 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (iocb->ki_pos > i_size_read(inode))
 		i_size_write(inode, iocb->ki_pos);
 	
+	pr_info("btfs_write_iter: written %u bytes\n", wrsp.bytes_written);
+	
 	return wrsp.bytes_written;
 }
-
 
 static int btfs_readdir(struct file *file, struct dir_context *ctx)
 {
