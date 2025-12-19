@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * BTFS Client Daemon - Fixed netlink communication
+ * BTFS Client Daemon - Complete version with PING keepalive
  */
 
 #include <stdio.h>
@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
@@ -21,6 +22,7 @@
 
 #define NETLINK_BTFS 31
 #define MAX_MSG_SIZE 8192
+#define PING_INTERVAL 5
 
 /* Netlink message format (must match kernel) */
 typedef struct {
@@ -195,6 +197,10 @@ static void *bt_recv_thread(void *arg)
 			continue;
 		}
 		
+		/* Skip PING responses */
+		if (rsp.opcode == BTFS_OP_PING)
+			continue;
+		
 		req = pending_find_by_bt(rsp.sequence);
 		if (!req) {
 			log_msg("Unknown BT sequence: %u", rsp.sequence);
@@ -221,6 +227,43 @@ static void *bt_recv_thread(void *arg)
 	}
 	
 	log_msg("BT receive thread stopped");
+	return NULL;
+}
+
+/*
+ * PING keepalive thread
+ */
+static void *ping_thread(void *arg)
+{
+	btfs_header_t hdr;
+	
+	log_msg("PING thread started");
+	
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.opcode = BTFS_OP_PING;
+	hdr.sequence = 0;
+	hdr.client_id = getpid();
+	hdr.flags = 0;
+	hdr.data_len = 0;
+	
+	while (running) {
+		sleep(PING_INTERVAL);
+		
+		if (!running)
+			break;
+		
+		pthread_mutex_lock(&bt_lock);
+		ssize_t ret = write(bt_sock, &hdr, sizeof(hdr));
+		pthread_mutex_unlock(&bt_lock);
+		
+		if (ret != sizeof(hdr)) {
+			log_msg("PING send failed, stopping");
+			running = 0;
+			break;
+		}
+	}
+	
+	log_msg("PING thread stopped");
 	return NULL;
 }
 
@@ -265,7 +308,7 @@ static int nl_send_reply(uint32_t dst_pid, uint32_t seq, int32_t result,
 	
 	memset(&dest, 0, sizeof(dest));
 	dest.nl_family = AF_NETLINK;
-	dest.nl_pid = dst_pid;  // Send to specific PID
+	dest.nl_pid = dst_pid;
 	dest.nl_groups = 0;
 	
 	if (sendto(nl_sock, nlh, nlh->nlmsg_len, 0,
@@ -325,9 +368,6 @@ static void *nl_recv_thread(void *arg)
 		
 		msg = (nl_msg_t *)NLMSG_DATA(nlh);
 		
-		log_msg("NL recv: op=%u seq=%u len=%u from_pid=%u",
-			msg->op, msg->seq, msg->len, nlh->nlmsg_pid);
-		
 		/* Allocate bluetooth sequence */
 		bt_seq = __sync_fetch_and_add(&bt_seq_gen, 1);
 		
@@ -367,10 +407,6 @@ static void *nl_recv_thread(void *arg)
 			      pend->rsp.result, pend->data, pend->rsp.data_len);
 		
 		pthread_mutex_unlock(&pend->lock);
-		
-		log_msg("NL reply: seq=%u res=%d len=%u to_pid=%u",
-			pend->nl_seq, pend->rsp.result, pend->rsp.data_len, pend->nl_pid);
-		
 		pending_remove(bt_seq);
 	}
 	
@@ -474,7 +510,7 @@ static void sighandler(int sig)
 int main(int argc, char **argv)
 {
 	struct sockaddr_nl local;
-	pthread_t bt_thread, nl_thread;
+	pthread_t bt_thread, nl_thread, ping_th;
 	
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <server_mac>\n", argv[0]);
@@ -486,7 +522,7 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 	
 	log_msg("==============================================");
-	log_msg("  BTFS Client Daemon");
+	log_msg("  BTFS Client Daemon v2.0");
 	log_msg("==============================================");
 	
 	/* Connect to Bluetooth server */
@@ -520,7 +556,7 @@ int main(int argc, char **argv)
 	
 	log_msg("Netlink socket bound (PID=%u)", getpid());
 	
-	/* Send hello to kernel - FIXED: dst_pid = 0 for kernel */
+	/* Send hello to kernel */
 	struct sockaddr_nl dest;
 	struct nlmsghdr *nlh;
 	nl_msg_t *msg;
@@ -542,7 +578,7 @@ int main(int argc, char **argv)
 	
 	memset(&dest, 0, sizeof(dest));
 	dest.nl_family = AF_NETLINK;
-	dest.nl_pid = 0;  // KERNEL!
+	dest.nl_pid = 0;
 	dest.nl_groups = 0;
 	
 	if (sendto(nl_sock, nlh, nlh->nlmsg_len, 0,
@@ -550,6 +586,7 @@ int main(int argc, char **argv)
 		log_msg("Sent hello to kernel");
 	}
 	
+	log_msg("PING interval: %d seconds", PING_INTERVAL);
 	log_msg("==============================================\n");
 	
 	/* Start threads */
@@ -569,11 +606,22 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	
+	if (pthread_create(&ping_th, NULL, ping_thread, NULL) != 0) {
+		perror("pthread_create ping");
+		running = 0;
+		pthread_join(bt_thread, NULL);
+		pthread_join(nl_thread, NULL);
+		close(nl_sock);
+		close(bt_sock);
+		return 1;
+	}
+	
 	log_msg("Daemon running. Press Ctrl+C to stop.");
 	
 	/* Wait */
 	pthread_join(bt_thread, NULL);
 	pthread_join(nl_thread, NULL);
+	pthread_join(ping_th, NULL);
 	
 	/* Cleanup */
 	close(nl_sock);

@@ -572,8 +572,6 @@ static int btfs_readdir(struct file *file, struct dir_context *ctx)
 	size_t off;
 	int ret;
 	
-	pr_info("btfs_readdir: pos=%lld\n", ctx->pos);
-	
 	if (ctx->pos == 0) {
 		if (!dir_emit_dot(file, ctx))
 			return 0;
@@ -589,56 +587,55 @@ static int btfs_readdir(struct file *file, struct dir_context *ctx)
 	if (ctx->pos == 2) {
 		memset(&req, 0, sizeof(req));
 		ret = btfs_path(file->f_path.dentry, req.path, BTFS_MAX_PATH);
-		if (ret) {
-			pr_err("btfs_readdir: path error %d\n", ret);
+		if (ret)
 			return ret;
-		}
 		
 		req.offset = 0;
-		
-		pr_info("btfs_readdir: calling RPC for path='%s'\n", req.path);
 		
 		buf = kmalloc(4096, GFP_KERNEL);
 		if (!buf)
 			return -ENOMEM;
 		
 		ret = btfs_rpc(mnt, BTFS_OP_READDIR, &req, sizeof(req), buf, 4096);
-		
-		pr_info("btfs_readdir: RPC returned %d\n", ret);
-		
 		if (ret < 0) {
 			kfree(buf);
 			return ret;
 		}
 		
 		off = 0;
-		while (off < 4096) {
+		while (off + sizeof(struct btfs_dirent) <= 4096) {
 			struct btfs_dirent *de = (void*)(buf + off);
+			size_t entry_size;
 			
-			if (de->name_len == 0 || de->name_len > 255) {
-				pr_info("btfs_readdir: end of list (name_len=%u)\n", de->name_len);
+			/* Конец списка */
+			if (de->name_len == 0 || de->name_len > 255)
 				break;
-			}
 			
-			pr_info("btfs_readdir: entry ino=%llu type=%u name_len=%u name='%s'\n",
-				de->ino, de->type, de->name_len, de->name);
-			
-			if (!dir_emit(ctx, de->name, de->name_len, de->ino, de->type)) {
-				pr_info("btfs_readdir: dir_emit returned false\n");
+			/* Проверка что запись полностью влезает */
+			entry_size = sizeof(struct btfs_dirent) + de->name_len + 1;
+			if (off + entry_size > 4096)
 				break;
-			}
 			
-			off += sizeof(struct btfs_dirent) + de->name_len + 1;
-			off = (off + 7) & ~7;
+			/* Убедиться что имя null-terminated */
+			de->name[de->name_len] = '\0';
+			
+			pr_info("btfs_readdir: emit ino=%llu type=%u name='%s'\n",
+				de->ino, de->type, de->name);
+			
+			if (!dir_emit(ctx, de->name, de->name_len, de->ino, de->type))
+				break;
+			
+			/* ИСПРАВЛЕНО: сервер НЕ выравнивает, просто переходим к следующей записи */
+			off += entry_size;
 		}
 		
 		kfree(buf);
 		ctx->pos = 3;
 	}
 	
-	pr_info("btfs_readdir: done, pos=%lld\n", ctx->pos);
 	return 0;
 }
+
 
 
 static const struct file_operations btfs_file_fops = {
