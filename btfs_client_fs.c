@@ -492,69 +492,70 @@ static int btfs_release(struct inode *inode, struct file *file)
 
 static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_file *bf;
-	struct btfs_read_req req;
-	struct btfs_read_resp *rsp;
-	char *rbuf;
-	size_t count = iov_iter_count(to);
-	loff_t pos = iocb->ki_pos;
-	ssize_t total = 0;
-	int ret;
-	
-	ret = btfs_ensure_open(inode, file);
-	if (ret < 0)
-		return ret;
-	
-	bf = file->private_data;
-	if (!bf || bf->fh == 0)
-		return -EBADF;
-	
-	rbuf = kmalloc(sizeof(*rsp) + PAGE_SIZE, GFP_KERNEL);
-	if (!rbuf)
-		return -ENOMEM;
-	
-	while (count > 0) {
-		size_t chunk = min_t(size_t, count, PAGE_SIZE);
-		
-		req.file_handle = bf->fh;
-		req.offset = pos;
-		req.size = chunk;
-		
-		pr_info("btfs_read_iter: handle=%llu offset=%lld size=%zu\n",
-			bf->fh, pos, chunk);
-		
-		ret = btfs_rpc(mnt, BTFS_OP_READ, &req, sizeof(req), rbuf, sizeof(*rsp) + chunk);
-		if (ret < 0) {
-			pr_err("btfs_read_iter: RPC failed %d\n", ret);
-			kfree(rbuf);
-			return total ? total : ret;
-		}
-		
-		rsp = (struct btfs_read_resp *)rbuf;
-		
-		if (rsp->bytes_read == 0)
-			break;
-		
-		if (copy_to_iter(rsp->data, rsp->bytes_read, to) != rsp->bytes_read) {
-			kfree(rbuf);
-			return total ? total : -EFAULT;
-		}
-		
-		total += rsp->bytes_read;
-		pos += rsp->bytes_read;
-		count -= rsp->bytes_read;
-		
-		if (rsp->bytes_read < chunk)
-			break;
-	}
-	
-	kfree(rbuf);
-	iocb->ki_pos = pos;
-	return total;
+    struct file *file = iocb->ki_filp;
+    struct inode *inode = file_inode(file);
+    struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+    struct btfs_file *bf;
+    struct btfs_read_req req;
+    struct btfs_read_resp *rsp;
+    char *rbuf;
+    size_t count = iov_iter_count(to);
+    loff_t pos = iocb->ki_pos;
+    ssize_t total = 0;
+    int ret;
+
+    ret = btfs_ensure_open(inode, file);
+    if (ret < 0)
+        return ret;
+
+    bf = file->private_data;
+    if (!bf || bf->fh == 0)
+        return -EBADF;
+
+    rbuf = kmalloc(sizeof(*rsp) + PAGE_SIZE, GFP_KERNEL);
+    if (!rbuf)
+        return -ENOMEM;
+
+    while (count > 0) {
+        size_t chunk = min_t(size_t, count, PAGE_SIZE);
+        
+        req.file_handle = bf->fh;
+        req.offset = pos;
+        req.size = chunk;
+
+        pr_info("btfs_read_iter: handle=%llu offset=%lld size=%zu\n",
+                bf->fh, pos, chunk);
+
+        ret = btfs_rpc(mnt, BTFS_OP_READ, &req, sizeof(req), rbuf, sizeof(*rsp) + chunk);
+        if (ret < 0) {
+            pr_err("btfs_read_iter: RPC failed %d\n", ret);
+            kfree(rbuf);
+            return total ? total : ret;
+        }
+
+        rsp = (struct btfs_read_resp *)rbuf;
+        
+        pr_info("btfs_read_iter: got bytes_read=%u\n", rsp->bytes_read);
+        
+        // EOF
+        if (rsp->bytes_read == 0)
+            break;
+
+        if (copy_to_iter(rsp->data, rsp->bytes_read, to) != rsp->bytes_read) {
+            kfree(rbuf);
+            return total ? total : -EFAULT;
+        }
+
+        total += rsp->bytes_read;
+        pos += rsp->bytes_read;
+        count -= rsp->bytes_read;
+    }
+
+    kfree(rbuf);
+    iocb->ki_pos = pos;
+    return total;
 }
+
 
 static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {

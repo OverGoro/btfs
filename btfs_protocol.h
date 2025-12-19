@@ -6,7 +6,7 @@
 #include <linux/limits.h>
 
 #define BTFS_MAX_PATH 256
-#define BTFS_MAX_DATA 8192
+#define BTFS_MAX_DATA 4096
 
 // Opcodes
 typedef enum {
