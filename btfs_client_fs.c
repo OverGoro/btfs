@@ -1,37 +1,32 @@
-// btfs_client_fs.c - Professional implementation based on NFS/CIFS architecture for Linux 6.14
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * BTFS Client Filesystem
+ * Architecture inspired by NFS, transport via netlink
+ */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
-#include <linux/dcache.h>
 #include <linux/pagemap.h>
 #include <linux/netlink.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
-#include <linux/mutex.h>
 #include <linux/wait.h>
-#include <linux/uaccess.h>
-#include <linux/statfs.h>
-#include <linux/backing-dev.h>
-#include <linux/namei.h>
-#include <linux/xattr.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("BTFS Team");
-MODULE_DESCRIPTION("Bluetooth Distributed File System - Client");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("Bluetooth Filesystem Client");
 
 #define BTFS_MAGIC 0x42544653
 #define NETLINK_BTFS 31
 #define BTFS_MAX_PATH 256
-#define BTFS_MAX_DATA 4096
-#define BTFS_DEFAULT_TIMEOUT (30 * HZ)
+#define BTFS_TIMEOUT (30*HZ)
 
-// Protocol opcodes (from btfs_protocol.h)
-enum btfs_opcode {
+/* Protocol opcodes */
+enum {
 	BTFS_OP_GETATTR = 1,
 	BTFS_OP_READDIR = 2,
 	BTFS_OP_OPEN = 10,
@@ -46,642 +41,452 @@ enum btfs_opcode {
 	BTFS_OP_TRUNCATE = 33,
 };
 
-// Lock types
-enum btfs_lock_type {
-	BTFS_LOCK_NONE = 0,
-	BTFS_LOCK_READ = 1,
-	BTFS_LOCK_WRITE = 2,
-};
-
-// Netlink message structure
-struct btfs_nl_msg {
-	u32 opcode;
-	u32 sequence;
-	s32 result;
-	u32 data_len;
-	u8 data[];
-} __packed;
-
-// Attribute structure
-struct btfs_attr {
-	u64 ino;
-	u64 size;
-	u64 blocks;
-	u32 mode;
-	u32 nlink;
-	u32 uid;
-	u32 gid;
-	u64 atime_sec;
-	u64 atime_nsec;
-	u64 mtime_sec;
-	u64 mtime_nsec;
-	u64 ctime_sec;
-	u64 ctime_nsec;
-} __packed;
-
-// Request structures
-struct btfs_path_req {
-	char path[BTFS_MAX_PATH];
-} __packed;
-
-struct btfs_open_req {
-	char path[BTFS_MAX_PATH];
-	u32 flags;
-	u32 mode;
-	u32 lock_type;
-} __packed;
-
-struct btfs_open_resp {
-	u64 file_handle;
-	u32 lock_acquired;
-} __packed;
-
-struct btfs_rw_req {
-	u64 file_handle;
-	u64 offset;
-	u32 size;
-} __packed;
-
-struct btfs_read_resp {
-	u32 bytes_read;
-	char data[];
-} __packed;
-
-struct btfs_write_req {
-	u64 file_handle;
-	u64 offset;
-	u32 size;
-	char data[];
-} __packed;
-
-struct btfs_write_resp {
-	u32 bytes_written;
-} __packed;
-
-struct btfs_close_req {
-	u64 file_handle;
-} __packed;
-
-struct btfs_mkdir_req {
-	char path[BTFS_MAX_PATH];
-	u32 mode;
-} __packed;
-
-struct btfs_create_req {
-	char path[BTFS_MAX_PATH];
-	u32 mode;
-	u32 flags;
-} __packed;
-
-struct btfs_rename_req {
-	char oldpath[BTFS_MAX_PATH];
-	char newpath[BTFS_MAX_PATH];
-} __packed;
-
-struct btfs_truncate_req {
-	char path[BTFS_MAX_PATH];
-	u64 size;
-} __packed;
-
-struct btfs_readdir_req {
-	char path[BTFS_MAX_PATH];
-	u64 offset;
-} __packed;
-
-struct btfs_dirent {
-	u64 ino;
-	u32 type;
-	u32 name_len;
-	char name[];
-} __packed;
-
-// Forward declarations
-static const struct inode_operations btfs_file_inode_operations;
-static const struct inode_operations btfs_dir_inode_operations;
-static const struct file_operations btfs_file_operations;
-static const struct file_operations btfs_dir_operations;
-
-// RPC request tracking (similar to NFS rpc_task)
-struct btfs_rpc_req {
-	struct list_head list;
+/* Netlink message */
+struct btfs_msg {
+	u32 op;
 	u32 seq;
-	wait_queue_head_t wait;
-	bool completed;
-	s32 result;
-	void *reply;
-	size_t reply_len;
-	struct rcu_head rcu;
+	s32 res;
+	u32 len;
+	u8 data[0];
+} __packed;
+
+/* File attributes */
+struct btfs_fattr {
+	u64 ino, size, blocks;
+	u32 mode, nlink, uid, gid;
+	u64 atime_s, atime_ns;
+	u64 mtime_s, mtime_ns;
+	u64 ctime_s, ctime_ns;
+} __packed;
+
+/* Directory entry */
+struct btfs_dent {
+	u64 ino;
+	u32 type, nlen;
+	char name[0];
+} __packed;
+
+/* RPC call context */
+struct btfs_call {
+	struct list_head link;
+	u32 seq;
+	wait_queue_head_t wq;
+	int done;
+	s32 err;
+	void *buf;
+	size_t buflen;
 };
 
-// Per-inode information (similar to nfs_inode)
-struct btfs_inode_info {
-	u64 file_handle;
-	unsigned long flags;
-	struct mutex open_lock;
-	struct inode vfs_inode;
+/* Mount context */
+struct btfs_mnt {
+	struct sock *sock;
+	u32 daemon;
+	int ready;
+	atomic_t seqno;
+	spinlock_t lock;
+	struct list_head calls;
 };
 
-// Per-file context (similar to nfs_open_context)
-struct btfs_file_info {
-	u64 handle;
-	int flags;
-	bool handle_valid;
+/* Inode context */
+struct btfs_ino {
+	struct inode vnode;
+	u64 fh;
+	struct mutex lock;
 };
 
-// Superblock context (similar to nfs_server)
-struct btfs_sb_info {
-	u32 daemon_pid;
-	spinlock_t req_lock;
-	struct list_head pending_reqs;
-	atomic_t seq_counter;
-	bool daemon_alive;
+/* File context */
+struct btfs_file {
+	u64 fh;
 };
 
-// Global state
-static struct kmem_cache *btfs_inode_cachep;
-static struct sock *btfs_nl_sock;
-static DEFINE_SPINLOCK(btfs_sb_lock);
-static struct btfs_sb_info *btfs_current_sbi;
+static struct kmem_cache *btfs_ino_cache;
+static struct sock *btfs_sock;
+static struct btfs_mnt *btfs_mnt_active;
+static DEFINE_SPINLOCK(btfs_mnt_lock);
 
-// Inode cache constructor
-static void btfs_inode_init_once(void *foo)
+#define BTFS_MNT(sb) ((struct btfs_mnt*)(sb)->s_fs_info)
+#define BTFS_INO(i) container_of((i), struct btfs_ino, vnode)
+
+/* Forward declarations */
+static const struct inode_operations btfs_dir_iops;
+static const struct inode_operations btfs_file_iops;
+static const struct file_operations btfs_dir_fops;
+static const struct file_operations btfs_file_fops;
+
+/*
+ * RPC helpers
+ */
+static struct btfs_call *btfs_call_new(struct btfs_mnt *mnt)
 {
-	struct btfs_inode_info *info = foo;
+	struct btfs_call *call;
 	
-	info->file_handle = 0;
-	info->flags = 0;
-	mutex_init(&info->open_lock);
-	inode_init_once(&info->vfs_inode);
-}
-
-// Helper macros
-#define BTFS_I(inode) container_of(inode, struct btfs_inode_info, vfs_inode)
-#define BTFS_SB(sb) ((struct btfs_sb_info *)(sb)->s_fs_info)
-
-// ============================================================================
-// RPC Request Management (similar to NFS RPC layer)
-// ============================================================================
-
-static struct btfs_rpc_req *btfs_rpc_alloc(struct btfs_sb_info *sbi)
-{
-	struct btfs_rpc_req *req;
-	
-	req = kzalloc(sizeof(*req), GFP_NOFS);
-	if (!req)
+	call = kzalloc(sizeof(*call), GFP_NOFS);
+	if (!call)
 		return NULL;
 	
-	req->seq = atomic_inc_return(&sbi->seq_counter);
-	init_waitqueue_head(&req->wait);
-	req->completed = false;
+	call->seq = atomic_inc_return(&mnt->seqno);
+	init_waitqueue_head(&call->wq);
 	
-	spin_lock(&sbi->req_lock);
-	list_add_tail_rcu(&req->list, &sbi->pending_reqs);
-	spin_unlock(&sbi->req_lock);
+	spin_lock(&mnt->lock);
+	list_add_tail(&call->link, &mnt->calls);
+	spin_unlock(&mnt->lock);
 	
-	return req;
+	return call;
 }
 
-static void btfs_rpc_free_callback(struct rcu_head *head)
+static void btfs_call_free(struct btfs_mnt *mnt, struct btfs_call *call)
 {
-	struct btfs_rpc_req *req = container_of(head, struct btfs_rpc_req, rcu);
-	kfree(req->reply);
-	kfree(req);
+	spin_lock(&mnt->lock);
+	list_del(&call->link);
+	spin_unlock(&mnt->lock);
+	
+	kfree(call->buf);
+	kfree(call);
 }
 
-static void btfs_rpc_free(struct btfs_sb_info *sbi, struct btfs_rpc_req *req)
+static struct btfs_call *btfs_call_find(struct btfs_mnt *mnt, u32 seq)
 {
-	spin_lock(&sbi->req_lock);
-	list_del_rcu(&req->list);
-	spin_unlock(&sbi->req_lock);
+	struct btfs_call *call;
 	
-	call_rcu(&req->rcu, btfs_rpc_free_callback);
-}
-
-static struct btfs_rpc_req *btfs_rpc_find(struct btfs_sb_info *sbi, u32 seq)
-{
-	struct btfs_rpc_req *req;
-	
-	rcu_read_lock();
-	list_for_each_entry_rcu(req, &sbi->pending_reqs, list) {
-		if (req->seq == seq) {
-			rcu_read_unlock();
-			return req;
+	spin_lock(&mnt->lock);
+	list_for_each_entry(call, &mnt->calls, link) {
+		if (call->seq == seq) {
+			spin_unlock(&mnt->lock);
+			return call;
 		}
 	}
-	rcu_read_unlock();
-	
+	spin_unlock(&mnt->lock);
 	return NULL;
 }
 
-static int btfs_rpc_send(struct btfs_sb_info *sbi, u32 opcode,
-			 const void *data, size_t len, u32 *seq_out)
+static int btfs_rpc(struct btfs_mnt *mnt, u32 op,
+		    const void *arg, size_t alen,
+		    void *reply, size_t rlen)
 {
+	struct btfs_call *call;
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
-	struct btfs_nl_msg *msg;
-	size_t total_len;
+	struct btfs_msg *msg;
+	size_t tot;
 	int ret;
 	
-	if (!sbi->daemon_alive)
+	if (!mnt->ready)
 		return -ENOTCONN;
 	
-	*seq_out = atomic_read(&sbi->seq_counter) + 1;
-	
-	total_len = sizeof(struct btfs_nl_msg) + len;
-	skb = nlmsg_new(total_len, GFP_NOFS);
-	if (!skb)
+	call = btfs_call_new(mnt);
+	if (!call)
 		return -ENOMEM;
 	
-	nlh = nlmsg_put(skb, 0, 0, NLMSG_DONE, total_len, 0);
-	if (!nlh) {
-		nlmsg_free(skb);
+	tot = sizeof(*msg) + alen;
+	skb = nlmsg_new(tot, GFP_NOFS);
+	if (!skb) {
+		btfs_call_free(mnt, call);
 		return -ENOMEM;
 	}
 	
+	nlh = nlmsg_put(skb, 0, 0, NLMSG_DONE, tot, 0);
 	msg = nlmsg_data(nlh);
-	msg->opcode = opcode;
-	msg->sequence = *seq_out;
-	msg->result = 0;
-	msg->data_len = len;
+	msg->op = op;
+	msg->seq = call->seq;
+	msg->res = 0;
+	msg->len = alen;
+	if (arg && alen)
+		memcpy(msg->data, arg, alen);
 	
-	if (data && len)
-		memcpy(msg->data, data, len);
-	
-	NETLINK_CB(skb).dst_group = 0;
-	
-	ret = nlmsg_unicast(btfs_nl_sock, skb, sbi->daemon_pid);
+	ret = nlmsg_unicast(mnt->sock, skb, mnt->daemon);
 	if (ret < 0) {
-		sbi->daemon_alive = false;
-		return -ENOTCONN;
+		btfs_call_free(mnt, call);
+		return ret;
 	}
 	
-	return 0;
-}
-
-static int btfs_rpc_wait_reply(struct btfs_rpc_req *req, void *reply_buf, size_t buf_size)
-{
-	long timeout;
-	int ret;
-	
-	timeout = wait_event_interruptible_timeout(req->wait,
-						   req->completed,
-						   BTFS_DEFAULT_TIMEOUT);
-	
-	if (timeout == 0)
+	ret = wait_event_interruptible_timeout(call->wq, call->done, BTFS_TIMEOUT);
+	if (ret == 0) {
+		btfs_call_free(mnt, call);
 		return -ETIMEDOUT;
-	if (timeout < 0)
-		return timeout;
-	
-	ret = req->result;
-	
-	if (ret >= 0 && reply_buf && buf_size && req->reply && req->reply_len) {
-		size_t copy_len = min(buf_size, req->reply_len);
-		memcpy(reply_buf, req->reply, copy_len);
+	}
+	if (ret < 0) {
+		btfs_call_free(mnt, call);
+		return ret;
 	}
 	
+	ret = call->err;
+	if (ret == 0 && reply && rlen && call->buf)
+		memcpy(reply, call->buf, min(rlen, call->buflen));
+	
+	btfs_call_free(mnt, call);
 	return ret;
 }
 
-// Netlink receive handler
-static void btfs_nl_recv(struct sk_buff *skb)
+/*
+ * Netlink callback
+ */
+static void btfs_nl_input(struct sk_buff *skb)
 {
-	struct nlmsghdr *nlh;
-	struct btfs_nl_msg *msg;
-	struct btfs_rpc_req *req;
-	struct btfs_sb_info *sbi;
+	struct nlmsghdr *nlh = nlmsg_hdr(skb);
+	struct btfs_msg *msg = nlmsg_data(nlh);
+	struct btfs_mnt *mnt;
+	struct btfs_call *call;
 	
-	nlh = nlmsg_hdr(skb);
-	msg = nlmsg_data(nlh);
+	spin_lock(&btfs_mnt_lock);
+	mnt = btfs_mnt_active;
+	spin_unlock(&btfs_mnt_lock);
 	
-	// ИСПРАВЛЕНО: используем глобальную переменную
-	spin_lock(&btfs_sb_lock);
-	sbi = btfs_current_sbi;
-	spin_unlock(&btfs_sb_lock);
-	
-	if (!sbi)
+	if (!mnt)
 		return;
 	
-	if (!sbi->daemon_pid) {
-		sbi->daemon_pid = nlh->nlmsg_pid;
-		sbi->daemon_alive = true;
-		pr_info("btfs: Daemon connected, PID=%u\n", sbi->daemon_pid);
+	if (!mnt->ready) {
+		mnt->daemon = nlh->nlmsg_pid;
+		mnt->ready = 1;
+		pr_info("btfs: daemon registered pid=%u\n", mnt->daemon);
 		return;
 	}
 	
-	req = btfs_rpc_find(sbi, msg->sequence);
-	if (!req)
+	call = btfs_call_find(mnt, msg->seq);
+	if (!call)
 		return;
 	
-	req->result = msg->result;
-	
-	if (msg->data_len > 0) {
-		req->reply = kmemdup(msg->data, msg->data_len, GFP_ATOMIC);
-		if (req->reply)
-			req->reply_len = msg->data_len;
+	call->err = msg->res;
+	if (msg->len > 0 && msg->res >= 0) {
+		call->buf = kmemdup(msg->data, msg->len, GFP_ATOMIC);
+		if (call->buf)
+			call->buflen = msg->len;
 	}
 	
-	req->completed = true;
-	wake_up(&req->wait);
+	call->done = 1;
+	wake_up(&call->wq);
 }
 
-// ============================================================================
-// Path Helpers
-// ============================================================================
-
-static void btfs_get_path(struct dentry *dentry, char *buf, size_t size)
+/*
+ * Path conversion
+ */
+static int btfs_path(struct dentry *dentry, char *buf, size_t sz)
 {
-	char *path, *tmp;
+	char *p, *tmp = (char*)__get_free_page(GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
 	
-	tmp = __getname();
-	if (!tmp) {
-		strscpy(buf, ".", size);
-		return;
+	p = dentry_path_raw(dentry, tmp, PAGE_SIZE);
+	if (IS_ERR(p)) {
+		free_page((unsigned long)tmp);
+		return PTR_ERR(p);
 	}
 	
-	path = dentry_path_raw(dentry, tmp, PATH_MAX);
-	if (IS_ERR(path)) {
-		strscpy(buf, ".", size);
-	} else {
-		// Skip leading slashes
-		while (*path == '/')
-			path++;
-		strscpy(buf, *path ? path : ".", size);
+	while (*p == '/') p++;
+	strscpy(buf, *p ? p : ".", sz);
+	free_page((unsigned long)tmp);
+	return 0;
+}
+
+/*
+ * Inode helpers
+ */
+static void btfs_fill_inode(struct inode *inode, struct btfs_fattr *fa)
+{
+	inode->i_ino = fa->ino;
+	inode->i_mode = fa->mode;
+	set_nlink(inode, fa->nlink);
+	i_uid_write(inode, fa->uid);
+	i_gid_write(inode, fa->gid);
+	i_size_write(inode, fa->size);
+	inode->i_blocks = fa->blocks;
+	
+	inode_set_atime(inode, fa->atime_s, fa->atime_ns);
+	inode_set_mtime(inode, fa->mtime_s, fa->mtime_ns);
+	inode_set_ctime(inode, fa->ctime_s, fa->ctime_ns);
+}
+
+static struct inode *btfs_new_inode(struct super_block *sb, struct btfs_fattr *fa)
+{
+	struct inode *inode = new_inode(sb);
+	if (!inode)
+		return NULL;
+	
+	btfs_fill_inode(inode, fa);
+	
+	if (S_ISDIR(fa->mode)) {
+		inode->i_op = &btfs_dir_iops;
+		inode->i_fop = &btfs_dir_fops;
+	} else if (S_ISREG(fa->mode)) {
+		inode->i_op = &btfs_file_iops;
+		inode->i_fop = &btfs_file_fops;
+		inode->i_data.a_ops = &empty_aops;
 	}
 	
-	__putname(tmp);
+	return inode;
 }
 
-// ============================================================================
-// Inode Attribute Management (like nfs_refresh_inode)
-// ============================================================================
-
-static void btfs_refresh_inode(struct inode *inode, const struct btfs_attr *attr)
+/*
+ * File operations
+ */
+static int btfs_open(struct inode *inode, struct file *file)
 {
-	inode->i_ino = attr->ino;
-	inode->i_mode = attr->mode;
-	set_nlink(inode, attr->nlink);
-	i_uid_write(inode, attr->uid);
-	i_gid_write(inode, attr->gid);
-	i_size_write(inode, attr->size);
-	inode->i_blocks = attr->blocks;
-	
-	// Time handling for Linux 6.14
-	inode_set_atime(inode, attr->atime_sec, attr->atime_nsec);
-	inode_set_mtime(inode, attr->mtime_sec, attr->mtime_nsec);
-	inode_set_ctime(inode, attr->ctime_sec, attr->ctime_nsec);
-}
-
-// ============================================================================
-// File Operations (like NFS file_operations)
-// ============================================================================
-
-static int btfs_file_open(struct inode *inode, struct file *file)
-{
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_inode_info *info = BTFS_I(inode);
-	struct btfs_file_info *finfo;
-	struct btfs_rpc_req *req;
-	struct btfs_open_req open_req;
-	struct btfs_open_resp open_resp;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	struct btfs_ino *bi = BTFS_INO(inode);
+	struct btfs_file *bf;
+	struct {
+		char path[BTFS_MAX_PATH];
+		u32 flags, mode, lock;
+	} __packed req;
+	struct {
+		u64 fh;
+		u32 locked;
+	} __packed rsp;
 	int ret;
 	
-	finfo = kzalloc(sizeof(*finfo), GFP_KERNEL);
-	if (!finfo)
+	bf = kzalloc(sizeof(*bf), GFP_KERNEL);
+	if (!bf)
 		return -ENOMEM;
 	
-	mutex_lock(&info->open_lock);
-	
-	// Reuse handle if already open
-	if (info->file_handle) {
-		finfo->handle = info->file_handle;
-		finfo->handle_valid = true;
-		finfo->flags = file->f_flags;
-		file->private_data = finfo;
-		mutex_unlock(&info->open_lock);
+	mutex_lock(&bi->lock);
+	if (bi->fh) {
+		bf->fh = bi->fh;
+		file->private_data = bf;
+		mutex_unlock(&bi->lock);
 		return 0;
 	}
 	
-	btfs_get_path(file->f_path.dentry, open_req.path, BTFS_MAX_PATH);
-	open_req.flags = file->f_flags & (O_RDONLY | O_WRONLY | O_RDWR | O_APPEND | O_TRUNC);
-	open_req.mode = 0;
-	open_req.lock_type = BTFS_LOCK_NONE;
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req) {
-		mutex_unlock(&info->open_lock);
-		kfree(finfo);
-		return -ENOMEM;
-	}
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_OPEN, &open_req, sizeof(open_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
-		mutex_unlock(&info->open_lock);
-		kfree(finfo);
+	ret = btfs_path(file->f_path.dentry, req.path, BTFS_MAX_PATH);
+	if (ret) {
+		mutex_unlock(&bi->lock);
+		kfree(bf);
 		return ret;
 	}
 	
-	ret = btfs_rpc_wait_reply(req, &open_resp, sizeof(open_resp));
-	btfs_rpc_free(sbi, req);
+	req.flags = file->f_flags & (O_RDONLY|O_WRONLY|O_RDWR);
+	req.mode = 0;
+	req.lock = 0;
 	
+	ret = btfs_rpc(mnt, BTFS_OP_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
 	if (ret < 0) {
-		mutex_unlock(&info->open_lock);
-		kfree(finfo);
+		mutex_unlock(&bi->lock);
+		kfree(bf);
 		return ret;
 	}
 	
-	info->file_handle = open_resp.file_handle;
-	finfo->handle = open_resp.file_handle;
-	finfo->handle_valid = true;
-	finfo->flags = file->f_flags;
-	file->private_data = finfo;
-	
-	mutex_unlock(&info->open_lock);
+	bi->fh = rsp.fh;
+	bf->fh = rsp.fh;
+	file->private_data = bf;
+	mutex_unlock(&bi->lock);
 	return 0;
 }
 
-static int btfs_file_release(struct inode *inode, struct file *file)
+static int btfs_release(struct inode *inode, struct file *file)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_file_info *finfo = file->private_data;
-	struct btfs_rpc_req *req;
-	struct btfs_close_req close_req;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	struct btfs_file *bf = file->private_data;
+	u64 fh;
 	
-	if (!finfo)
+	if (!bf)
 		return 0;
 	
-	if (!finfo->handle_valid || !sbi->daemon_alive) {
-		kfree(finfo);
-		return 0;
-	}
+	fh = bf->fh;
+	kfree(bf);
 	
-	close_req.file_handle = finfo->handle;
+	if (mnt->ready)
+		btfs_rpc(mnt, BTFS_OP_CLOSE, &fh, sizeof(fh), NULL, 0);
 	
-	req = btfs_rpc_alloc(sbi);
-	if (req) {
-		if (btfs_rpc_send(sbi, BTFS_OP_CLOSE, &close_req,
-				  sizeof(u64), &seq) == 0) {
-			btfs_rpc_wait_reply(req, NULL, 0);
-		}
-		btfs_rpc_free(sbi, req);
-	}
-	
-	kfree(finfo);
 	return 0;
 }
 
-static ssize_t btfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_file_info *finfo = file->private_data;
-	struct btfs_rpc_req *req;
-	struct btfs_rw_req read_req;
-	struct btfs_read_resp *read_resp;
-	char *rbuf;
-	u32 seq;
-	ssize_t ret;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	struct btfs_file *bf = file->private_data;
+	struct {
+		u64 fh, off;
+		u32 sz;
+	} __packed req;
+	struct {
+		u32 nr;
+		char data[PAGE_SIZE];
+	} rsp;
 	size_t count = iov_iter_count(to);
 	loff_t pos = iocb->ki_pos;
 	ssize_t total = 0;
+	int ret;
 	
-	if (!finfo || !finfo->handle_valid)
+	if (!bf)
 		return -EBADF;
 	
 	while (count > 0) {
 		size_t chunk = min_t(size_t, count, PAGE_SIZE);
 		
-		read_req.file_handle = finfo->handle;
-		read_req.offset = pos;
-		read_req.size = chunk;
+		req.fh = bf->fh;
+		req.off = pos;
+		req.sz = chunk;
 		
-		req = btfs_rpc_alloc(sbi);
-		if (!req)
-			return total ? total : -ENOMEM;
-		
-		ret = btfs_rpc_send(sbi, BTFS_OP_READ, &read_req, sizeof(read_req), &seq);
-		if (ret < 0) {
-			btfs_rpc_free(sbi, req);
+		ret = btfs_rpc(mnt, BTFS_OP_READ, &req, sizeof(req), &rsp, sizeof(rsp));
+		if (ret < 0)
 			return total ? total : ret;
-		}
 		
-		rbuf = kmalloc(sizeof(struct btfs_read_resp) + chunk, GFP_NOFS);
-		if (!rbuf) {
-			btfs_rpc_free(sbi, req);
-			return total ? total : -ENOMEM;
-		}
-		
-		ret = btfs_rpc_wait_reply(req, rbuf, sizeof(struct btfs_read_resp) + chunk);
-		btfs_rpc_free(sbi, req);
-		
-		if (ret < 0) {
-			kfree(rbuf);
-			return total ? total : ret;
-		}
-		
-		read_resp = (struct btfs_read_resp *)rbuf;
-		
-		if (read_resp->bytes_read > 0) {
-			size_t copied = copy_to_iter(read_resp->data,
-						     read_resp->bytes_read, to);
-			if (copied != read_resp->bytes_read) {
-				kfree(rbuf);
-				return total ? total : -EFAULT;
-			}
-			
-			total += copied;
-			pos += copied;
-			count -= copied;
-			
-			if (read_resp->bytes_read < chunk) {
-				kfree(rbuf);
-				break;
-			}
-		} else {
-			kfree(rbuf);
+		if (rsp.nr == 0)
 			break;
-		}
 		
-		kfree(rbuf);
+		if (copy_to_iter(rsp.data, rsp.nr, to) != rsp.nr)
+			return total ? total : -EFAULT;
+		
+		total += rsp.nr;
+		pos += rsp.nr;
+		count -= rsp.nr;
+		
+		if (rsp.nr < chunk)
+			break;
 	}
 	
 	iocb->ki_pos = pos;
 	return total;
 }
 
-static ssize_t btfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_file_info *finfo = file->private_data;
-	struct btfs_rpc_req *req;
-	struct btfs_write_req *write_req;
-	struct btfs_write_resp write_resp;
-	size_t total_size;
-	u32 seq;
-	int ret;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	struct btfs_file *bf = file->private_data;
+	struct {
+		u64 fh, off;
+		u32 sz;
+		char data[PAGE_SIZE];
+	} req;
+	struct {
+		u32 nw;
+	} rsp;
 	size_t count = iov_iter_count(from);
 	loff_t pos = iocb->ki_pos;
+	int ret;
 	
-	if (!finfo || !finfo->handle_valid)
+	if (!bf)
 		return -EBADF;
 	
-	total_size = sizeof(struct btfs_write_req) + count;
-	write_req = kmalloc(total_size, GFP_NOFS);
-	if (!write_req)
-		return -ENOMEM;
+	req.fh = bf->fh;
+	req.off = pos;
+	req.sz = count;
 	
-	write_req->file_handle = finfo->handle;
-	write_req->offset = pos;
-	write_req->size = count;
-	
-	if (!copy_from_iter_full(write_req->data, count, from)) {
-		kfree(write_req);
+	if (!copy_from_iter_full(req.data, count, from))
 		return -EFAULT;
-	}
 	
-	req = btfs_rpc_alloc(sbi);
-	if (!req) {
-		kfree(write_req);
-		return -ENOMEM;
-	}
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_WRITE, write_req, total_size, &seq);
-	kfree(write_req);
-	
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
-		return ret;
-	}
-	
-	ret = btfs_rpc_wait_reply(req, &write_resp, sizeof(write_resp));
-	btfs_rpc_free(sbi, req);
-	
+	ret = btfs_rpc(mnt, BTFS_OP_WRITE, &req, sizeof(req.fh) + sizeof(req.off) + sizeof(req.sz) + count,
+		       &rsp, sizeof(rsp));
 	if (ret < 0)
 		return ret;
 	
-	iocb->ki_pos = pos + write_resp.bytes_written;
-	
+	iocb->ki_pos = pos + rsp.nw;
 	if (iocb->ki_pos > i_size_read(inode))
 		i_size_write(inode, iocb->ki_pos);
 	
-	return write_resp.bytes_written;
+	return rsp.nw;
 }
 
 static int btfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_readdir_req readdir_req;
-	char *rbuf;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	char path[BTFS_MAX_PATH];
+	char *buf;
+	size_t off;
 	int ret;
-	size_t offset;
 	
 	if (ctx->pos == 0) {
 		if (!dir_emit_dot(file, ctx))
@@ -698,192 +503,124 @@ static int btfs_readdir(struct file *file, struct dir_context *ctx)
 	if (ctx->pos >= 2)
 		return 0;
 	
-	btfs_get_path(file->f_path.dentry, readdir_req.path, BTFS_MAX_PATH);
-	readdir_req.offset = 0;
+	ret = btfs_path(file->f_path.dentry, path, BTFS_MAX_PATH);
+	if (ret)
+		return ret;
 	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
+	buf = kmalloc(4096, GFP_KERNEL);
+	if (!buf)
 		return -ENOMEM;
 	
-	ret = btfs_rpc_send(sbi, BTFS_OP_READDIR, &readdir_req, sizeof(readdir_req), &seq);
+	ret = btfs_rpc(mnt, BTFS_OP_READDIR, path, strlen(path)+1, buf, 4096);
 	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+		kfree(buf);
 		return ret;
 	}
 	
-	rbuf = kmalloc(BTFS_MAX_DATA, GFP_NOFS);
-	if (!rbuf) {
-		btfs_rpc_free(sbi, req);
-		return -ENOMEM;
-	}
-	
-	ret = btfs_rpc_wait_reply(req, rbuf, BTFS_MAX_DATA);
-	btfs_rpc_free(sbi, req);
-	
-	if (ret < 0) {
-		kfree(rbuf);
-		return ret;
-	}
-	
-	offset = 0;
-	while (offset < BTFS_MAX_DATA) {
-		struct btfs_dirent *dirent = (struct btfs_dirent *)(rbuf + offset);
+	off = 0;
+	while (off < 4096) {
+		struct btfs_dent *de = (void*)(buf + off);
 		
-		if (!dirent->name_len || dirent->name_len > NAME_MAX)
+		if (de->nlen == 0 || de->nlen > 255)
 			break;
 		
-		if (!dir_emit(ctx, dirent->name, dirent->name_len,
-			      dirent->ino, dirent->type))
+		if (!dir_emit(ctx, de->name, de->nlen, de->ino, de->type))
 			break;
 		
-		offset += sizeof(struct btfs_dirent) + dirent->name_len + 1;
+		off += sizeof(*de) + de->nlen + 1;
 	}
 	
-	kfree(rbuf);
+	kfree(buf);
 	ctx->pos = 3;
-	
 	return 0;
 }
 
-static const struct file_operations btfs_file_operations = {
-	.open		= btfs_file_open,
-	.release	= btfs_file_release,
-	.read_iter	= btfs_file_read_iter,
-	.write_iter	= btfs_file_write_iter,
-	.llseek		= generic_file_llseek,
-	.fsync		= noop_fsync,
-	.splice_read	= filemap_splice_read,
-	.splice_write	= iter_file_splice_write,
+static const struct file_operations btfs_file_fops = {
+	.open = btfs_open,
+	.release = btfs_release,
+	.read_iter = btfs_read_iter,
+	.write_iter = btfs_write_iter,
+	.llseek = generic_file_llseek,
 };
 
-static const struct file_operations btfs_dir_operations = {
-	.iterate_shared	= btfs_readdir,
-	.llseek		= generic_file_llseek,
+static const struct file_operations btfs_dir_fops = {
+	.iterate_shared = btfs_readdir,
+	.llseek = generic_file_llseek,
 };
 
-// ============================================================================
-// Inode Operations (like NFS inode_operations)
-// ============================================================================
-
+/*
+ * Inode operations
+ */
 static int btfs_getattr(struct mnt_idmap *idmap, const struct path *path,
-			struct kstat *stat, u32 request_mask, unsigned int flags)
+			struct kstat *stat, u32 req, unsigned int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_path_req getattr_req;
-	struct btfs_attr attr;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	char p[BTFS_MAX_PATH];
+	struct btfs_fattr fa;
 	int ret;
 	
-	btfs_get_path(path->dentry, getattr_req.path, BTFS_MAX_PATH);
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return -ENOMEM;
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_GETATTR, &getattr_req, sizeof(getattr_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
-		return ret;
-	}
-	
-	ret = btfs_rpc_wait_reply(req, &attr, sizeof(attr));
-	btfs_rpc_free(sbi, req);
-	
-	if (ret < 0)
+	ret = btfs_path(path->dentry, p, BTFS_MAX_PATH);
+	if (ret)
 		return ret;
 	
-	btfs_refresh_inode(inode, &attr);
-	generic_fillattr(idmap, request_mask, inode, stat);
+	ret = btfs_rpc(mnt, BTFS_OP_GETATTR, p, strlen(p)+1, &fa, sizeof(fa));
+	if (ret)
+		return ret;
 	
+	btfs_fill_inode(inode, &fa);
+	generic_fillattr(idmap, req, inode, stat);
 	return 0;
 }
 
-static struct dentry *btfs_lookup(struct inode *dir, struct dentry *dentry,
-				  unsigned int flags)
+static struct dentry *btfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(dir->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_path_req getattr_req;
-	struct btfs_attr attr;
-	struct inode *inode = NULL;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(dir->i_sb);
+	char path[BTFS_MAX_PATH];
+	struct btfs_fattr fa;
+	struct inode *inode;
 	int ret;
 	
-	if (dentry->d_name.len > NAME_MAX)
+	if (dentry->d_name.len > 255)
 		return ERR_PTR(-ENAMETOOLONG);
 	
-	btfs_get_path(dentry, getattr_req.path, BTFS_MAX_PATH);
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return ERR_PTR(-ENOMEM);
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_GETATTR, &getattr_req, sizeof(getattr_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+	ret = btfs_path(dentry, path, BTFS_MAX_PATH);
+	if (ret)
 		return ERR_PTR(ret);
-	}
 	
-	ret = btfs_rpc_wait_reply(req, &attr, sizeof(attr));
-	btfs_rpc_free(sbi, req);
-	
+	ret = btfs_rpc(mnt, BTFS_OP_GETATTR, path, strlen(path)+1, &fa, sizeof(fa));
 	if (ret == -ENOENT)
 		return d_splice_alias(NULL, dentry);
-	
-	if (ret < 0)
+	if (ret)
 		return ERR_PTR(ret);
 	
-	inode = new_inode(dir->i_sb);
+	inode = btfs_new_inode(dir->i_sb, &fa);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 	
-	btfs_refresh_inode(inode, &attr);
-	
-	if (S_ISDIR(attr.mode)) {
-		inode->i_op = &btfs_dir_inode_operations;
-		inode->i_fop = &btfs_dir_operations;
-	} else if (S_ISREG(attr.mode)) {
-		inode->i_op = &btfs_file_inode_operations;
-		inode->i_fop = &btfs_file_operations;
-		inode->i_data.a_ops = &empty_aops;
-	} else {
-		init_special_inode(inode, attr.mode, 0);
-	}
-	
-	unlock_new_inode(inode);
 	return d_splice_alias(inode, dentry);
 }
 
 static int btfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, bool excl)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(dir->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_create_req create_req;
+	struct btfs_mnt *mnt = BTFS_MNT(dir->i_sb);
+	struct {
+		char path[BTFS_MAX_PATH];
+		u32 mode, flags;
+	} __packed req;
 	struct inode *inode;
-	u32 seq;
 	int ret;
 	
-	btfs_get_path(dentry, create_req.path, BTFS_MAX_PATH);
-	create_req.mode = mode;
-	create_req.flags = 0;
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return -ENOMEM;
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_CREATE, &create_req, sizeof(create_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+	ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+	if (ret)
 		return ret;
-	}
 	
-	ret = btfs_rpc_wait_reply(req, NULL, 0);
-	btfs_rpc_free(sbi, req);
+	req.mode = mode;
+	req.flags = 0;
 	
-	if (ret < 0)
+	ret = btfs_rpc(mnt, BTFS_OP_CREATE, &req, sizeof(req), NULL, 0);
+	if (ret)
 		return ret;
 	
 	inode = new_inode(dir->i_sb);
@@ -892,8 +629,8 @@ static int btfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	
 	inode->i_ino = get_next_ino();
 	inode->i_mode = mode;
-	inode->i_op = &btfs_file_inode_operations;
-	inode->i_fop = &btfs_file_operations;
+	inode->i_op = &btfs_file_iops;
+	inode->i_fop = &btfs_file_fops;
 	inode->i_data.a_ops = &empty_aops;
 	inode_init_owner(idmap, inode, dir, mode);
 	
@@ -903,57 +640,36 @@ static int btfs_create(struct mnt_idmap *idmap, struct inode *dir,
 
 static int btfs_unlink(struct inode *dir, struct dentry *dentry)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(dir->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_path_req unlink_req;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(dir->i_sb);
+	char path[BTFS_MAX_PATH];
 	int ret;
 	
-	btfs_get_path(dentry, unlink_req.path, BTFS_MAX_PATH);
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return -ENOMEM;
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_UNLINK, &unlink_req, sizeof(unlink_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+	ret = btfs_path(dentry, path, BTFS_MAX_PATH);
+	if (ret)
 		return ret;
-	}
 	
-	ret = btfs_rpc_wait_reply(req, NULL, 0);
-	btfs_rpc_free(sbi, req);
-	
-	return ret;
+	return btfs_rpc(mnt, BTFS_OP_UNLINK, path, strlen(path)+1, NULL, 0);
 }
 
 static int btfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *dentry, umode_t mode)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(dir->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_mkdir_req mkdir_req;
+	struct btfs_mnt *mnt = BTFS_MNT(dir->i_sb);
+	struct {
+		char path[BTFS_MAX_PATH];
+		u32 mode;
+	} __packed req;
 	struct inode *inode;
-	u32 seq;
 	int ret;
 	
-	btfs_get_path(dentry, mkdir_req.path, BTFS_MAX_PATH);
-	mkdir_req.mode = mode;
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return -ENOMEM;
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_MKDIR, &mkdir_req, sizeof(mkdir_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+	ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+	if (ret)
 		return ret;
-	}
 	
-	ret = btfs_rpc_wait_reply(req, NULL, 0);
-	btfs_rpc_free(sbi, req);
+	req.mode = mode;
 	
-	if (ret < 0)
+	ret = btfs_rpc(mnt, BTFS_OP_MKDIR, &req, sizeof(req), NULL, 0);
+	if (ret)
 		return ret;
 	
 	inode = new_inode(dir->i_sb);
@@ -962,40 +678,27 @@ static int btfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	
 	inode->i_ino = get_next_ino();
 	inode->i_mode = S_IFDIR | mode;
-	inode->i_op = &btfs_dir_inode_operations;
-	inode->i_fop = &btfs_dir_operations;
+	inode->i_op = &btfs_dir_iops;
+	inode->i_fop = &btfs_dir_fops;
 	inode_init_owner(idmap, inode, dir, S_IFDIR | mode);
 	set_nlink(inode, 2);
 	
 	d_instantiate(dentry, inode);
 	inc_nlink(dir);
-	
 	return 0;
 }
 
 static int btfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(dir->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_path_req rmdir_req;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(dir->i_sb);
+	char path[BTFS_MAX_PATH];
 	int ret;
 	
-	btfs_get_path(dentry, rmdir_req.path, BTFS_MAX_PATH);
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return -ENOMEM;
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_RMDIR, &rmdir_req, sizeof(rmdir_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+	ret = btfs_path(dentry, path, BTFS_MAX_PATH);
+	if (ret)
 		return ret;
-	}
 	
-	ret = btfs_rpc_wait_reply(req, NULL, 0);
-	btfs_rpc_free(sbi, req);
-	
+	ret = btfs_rpc(mnt, BTFS_OP_RMDIR, path, strlen(path)+1, NULL, 0);
 	if (ret == 0)
 		drop_nlink(dir);
 	
@@ -1003,46 +706,39 @@ static int btfs_rmdir(struct inode *dir, struct dentry *dentry)
 }
 
 static int btfs_rename(struct mnt_idmap *idmap,
-		       struct inode *old_dir, struct dentry *old_dentry,
-		       struct inode *new_dir, struct dentry *new_dentry,
+		       struct inode *odir, struct dentry *odentry,
+		       struct inode *ndir, struct dentry *ndentry,
 		       unsigned int flags)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(old_dir->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_rename_req rename_req;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(odir->i_sb);
+	struct {
+		char old[BTFS_MAX_PATH];
+		char new[BTFS_MAX_PATH];
+	} __packed req;
 	int ret;
 	
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 	
-	btfs_get_path(old_dentry, rename_req.oldpath, BTFS_MAX_PATH);
-	btfs_get_path(new_dentry, rename_req.newpath, BTFS_MAX_PATH);
-	
-	req = btfs_rpc_alloc(sbi);
-	if (!req)
-		return -ENOMEM;
-	
-	ret = btfs_rpc_send(sbi, BTFS_OP_RENAME, &rename_req, sizeof(rename_req), &seq);
-	if (ret < 0) {
-		btfs_rpc_free(sbi, req);
+	ret = btfs_path(odentry, req.old, BTFS_MAX_PATH);
+	if (ret)
 		return ret;
-	}
 	
-	ret = btfs_rpc_wait_reply(req, NULL, 0);
-	btfs_rpc_free(sbi, req);
+	ret = btfs_path(ndentry, req.new, BTFS_MAX_PATH);
+	if (ret)
+		return ret;
 	
-	return ret;
+	return btfs_rpc(mnt, BTFS_OP_RENAME, &req, sizeof(req), NULL, 0);
 }
 
-static int btfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
-			struct iattr *attr)
+static int btfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
-	struct btfs_sb_info *sbi = BTFS_SB(inode->i_sb);
-	struct btfs_rpc_req *req;
-	struct btfs_truncate_req truncate_req;
-	u32 seq;
+	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+	struct {
+		char path[BTFS_MAX_PATH];
+		u64 size;
+	} __packed req;
 	int ret;
 	
 	ret = setattr_prepare(idmap, dentry, attr);
@@ -1050,24 +746,14 @@ static int btfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		return ret;
 	
 	if (attr->ia_valid & ATTR_SIZE) {
-		btfs_get_path(dentry, truncate_req.path, BTFS_MAX_PATH);
-		truncate_req.size = attr->ia_size;
-		
-		req = btfs_rpc_alloc(sbi);
-		if (!req)
-			return -ENOMEM;
-		
-		ret = btfs_rpc_send(sbi, BTFS_OP_TRUNCATE, &truncate_req,
-				    sizeof(truncate_req), &seq);
-		if (ret < 0) {
-			btfs_rpc_free(sbi, req);
+		ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+		if (ret)
 			return ret;
-		}
 		
-		ret = btfs_rpc_wait_reply(req, NULL, 0);
-		btfs_rpc_free(sbi, req);
+		req.size = attr->ia_size;
 		
-		if (ret < 0)
+		ret = btfs_rpc(mnt, BTFS_OP_TRUNCATE, &req, sizeof(req), NULL, 0);
+		if (ret)
 			return ret;
 		
 		truncate_setsize(inode, attr->ia_size);
@@ -1075,43 +761,41 @@ static int btfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	
 	setattr_copy(idmap, inode, attr);
 	mark_inode_dirty(inode);
-	
 	return 0;
 }
 
-static const struct inode_operations btfs_file_inode_operations = {
-	.getattr	= btfs_getattr,
-	.setattr	= btfs_setattr,
+static const struct inode_operations btfs_file_iops = {
+	.getattr = btfs_getattr,
+	.setattr = btfs_setattr,
 };
 
-static const struct inode_operations btfs_dir_inode_operations = {
-	.lookup		= btfs_lookup,
-	.getattr	= btfs_getattr,
-	.create		= btfs_create,
-	.unlink		= btfs_unlink,
-	.mkdir		= btfs_mkdir,
-	.rmdir		= btfs_rmdir,
-	.rename		= btfs_rename,
+static const struct inode_operations btfs_dir_iops = {
+	.lookup = btfs_lookup,
+	.getattr = btfs_getattr,
+	.create = btfs_create,
+	.unlink = btfs_unlink,
+	.mkdir = btfs_mkdir,
+	.rmdir = btfs_rmdir,
+	.rename = btfs_rename,
 };
 
-// ============================================================================
-// Superblock Operations (like NFS super_operations)
-// ============================================================================
-
+/*
+ * Superblock operations
+ */
 static struct inode *btfs_alloc_inode(struct super_block *sb)
 {
-	struct btfs_inode_info *info;
-	
-	info = kmem_cache_alloc(btfs_inode_cachep, GFP_KERNEL);
-	if (!info)
+	struct btfs_ino *bi = kmem_cache_alloc(btfs_ino_cache, GFP_KERNEL);
+	if (!bi)
 		return NULL;
 	
-	return &info->vfs_inode;
+	bi->fh = 0;
+	mutex_init(&bi->lock);
+	return &bi->vnode;
 }
 
 static void btfs_free_inode(struct inode *inode)
 {
-	kmem_cache_free(btfs_inode_cachep, BTFS_I(inode));
+	kmem_cache_free(btfs_ino_cache, BTFS_INO(inode));
 }
 
 static void btfs_evict_inode(struct inode *inode)
@@ -1122,179 +806,134 @@ static void btfs_evict_inode(struct inode *inode)
 
 static void btfs_put_super(struct super_block *sb)
 {
-	struct btfs_sb_info *sbi = BTFS_SB(sb);
-	struct btfs_rpc_req *req, *tmp;
+	struct btfs_mnt *mnt = BTFS_MNT(sb);
+	struct btfs_call *call, *tmp;
 	
-	if (!sbi)
+	if (!mnt)
 		return;
 	
-	// Remove from global list
-	spin_lock(&btfs_sb_lock);
-	if (btfs_current_sbi == sbi)
-		btfs_current_sbi = NULL;
-	spin_unlock(&btfs_sb_lock);
+	spin_lock(&btfs_mnt_lock);
+	if (btfs_mnt_active == mnt)
+		btfs_mnt_active = NULL;
+	spin_unlock(&btfs_mnt_lock);
 	
-	// Wake up all pending requests
-	spin_lock(&sbi->req_lock);
-	list_for_each_entry_safe(req, tmp, &sbi->pending_reqs, list) {
-		req->completed = true;
-		req->result = -ESHUTDOWN;
-		wake_up(&req->wait);
+	spin_lock(&mnt->lock);
+	list_for_each_entry_safe(call, tmp, &mnt->calls, link) {
+		call->done = 1;
+		call->err = -ESHUTDOWN;
+		wake_up(&call->wq);
 	}
-	spin_unlock(&sbi->req_lock);
+	spin_unlock(&mnt->lock);
 	
-	synchronize_rcu();
-	
-	kfree(sbi);
-	sb->s_fs_info = NULL;
+	kfree(mnt);
 }
 
-static const struct super_operations btfs_super_ops = {
-	.alloc_inode	= btfs_alloc_inode,
-	.free_inode	= btfs_free_inode,
-	.evict_inode	= btfs_evict_inode,
-	.put_super	= btfs_put_super,
-	.statfs		= simple_statfs,
-	.drop_inode	= generic_delete_inode,
+static const struct super_operations btfs_sops = {
+	.alloc_inode = btfs_alloc_inode,
+	.free_inode = btfs_free_inode,
+	.evict_inode = btfs_evict_inode,
+	.put_super = btfs_put_super,
+	.statfs = simple_statfs,
+	.drop_inode = generic_delete_inode,
 };
-
-// ============================================================================
-// Mount/Unmount (like NFS mount)
-// ============================================================================
 
 static int btfs_fill_super(struct super_block *sb, void *data, int silent)
 {
-	struct btfs_sb_info *sbi;
+	struct btfs_mnt *mnt;
 	struct inode *root;
 	
-	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
-	if (!sbi)
+	mnt = kzalloc(sizeof(*mnt), GFP_KERNEL);
+	if (!mnt)
 		return -ENOMEM;
 	
-	spin_lock_init(&sbi->req_lock);
-	INIT_LIST_HEAD(&sbi->pending_reqs);
-	atomic_set(&sbi->seq_counter, 0);
-	sbi->daemon_alive = false;
-	sbi->daemon_pid = 0;
+	spin_lock_init(&mnt->lock);
+	INIT_LIST_HEAD(&mnt->calls);
+	atomic_set(&mnt->seqno, 0);
+	mnt->sock = btfs_sock;
 	
-	// Register as current superblock
-	spin_lock(&btfs_sb_lock);
-	btfs_current_sbi = sbi;
-	spin_unlock(&btfs_sb_lock);
+	spin_lock(&btfs_mnt_lock);
+	btfs_mnt_active = mnt;
+	spin_unlock(&btfs_mnt_lock);
 	
-	sb->s_fs_info = sbi;
+	sb->s_fs_info = mnt;
 	sb->s_magic = BTFS_MAGIC;
-	sb->s_op = &btfs_super_ops;
+	sb->s_op = &btfs_sops;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
 	sb->s_time_gran = 1;
-	sb->s_flags |= SB_NODIRATIME;
 	
 	root = new_inode(sb);
-	if (!root) {
-		spin_lock(&btfs_sb_lock);
-		btfs_current_sbi = NULL;
-		spin_unlock(&btfs_sb_lock);
-		kfree(sbi);
+	if (!root)
 		return -ENOMEM;
-	}
 	
 	root->i_ino = 1;
 	root->i_mode = S_IFDIR | 0755;
-	root->i_op = &btfs_dir_inode_operations;
-	root->i_fop = &btfs_dir_operations;
+	root->i_op = &btfs_dir_iops;
+	root->i_fop = &btfs_dir_fops;
 	set_nlink(root, 2);
 	inode_init_owner(&nop_mnt_idmap, root, NULL, S_IFDIR | 0755);
 	
 	sb->s_root = d_make_root(root);
-	if (!sb->s_root) {
-		spin_lock(&btfs_sb_lock);
-		btfs_current_sbi = NULL;
-		spin_unlock(&btfs_sb_lock);
-		kfree(sbi);
+	if (!sb->s_root)
 		return -ENOMEM;
-	}
 	
 	return 0;
 }
 
-static struct dentry *btfs_mount(struct file_system_type *fs_type, int flags,
-				  const char *dev_name, void *data)
+static struct dentry *btfs_mount(struct file_system_type *fs, int flags,
+				 const char *dev, void *data)
 {
-	return mount_nodev(fs_type, flags, data, btfs_fill_super);
+	return mount_nodev(fs, flags, data, btfs_fill_super);
 }
 
-static void btfs_kill_sb(struct super_block *sb)
-{
-	kill_litter_super(sb);
-}
-
-static struct file_system_type btfs_fs_type = {
-	.owner		= THIS_MODULE,
-	.name		= "btfs",
-	.mount		= btfs_mount,
-	.kill_sb	= btfs_kill_sb,
-	.fs_flags	= FS_USERNS_MOUNT,
+static struct file_system_type btfs_type = {
+	.owner = THIS_MODULE,
+	.name = "btfs",
+	.mount = btfs_mount,
+	.kill_sb = kill_litter_super,
 };
 
-// ============================================================================
-// Module Init/Exit
-// ============================================================================
+static void btfs_ino_init(void *obj)
+{
+	struct btfs_ino *bi = obj;
+	inode_init_once(&bi->vnode);
+}
 
 static int __init btfs_init(void)
 {
-	struct netlink_kernel_cfg cfg = {
-		.input = btfs_nl_recv,
-	};
-	int ret;
+	struct netlink_kernel_cfg cfg = { .input = btfs_nl_input };
 	
-	pr_info("btfs: Initializing BTFS client module\n");
+	btfs_ino_cache = kmem_cache_create("btfs_inode",
+					   sizeof(struct btfs_ino), 0,
+					   SLAB_RECLAIM_ACCOUNT|SLAB_ACCOUNT,
+					   btfs_ino_init);
+	if (!btfs_ino_cache)
+		return -ENOMEM;
 	
-	btfs_inode_cachep = kmem_cache_create("btfs_inode_cache",
-					      sizeof(struct btfs_inode_info),
-					      0,
-					      SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
-					      btfs_inode_init_once);
-	if (!btfs_inode_cachep) {
-		pr_err("btfs: Failed to create inode cache\n");
+	btfs_sock = netlink_kernel_create(&init_net, NETLINK_BTFS, &cfg);
+	if (!btfs_sock) {
+		kmem_cache_destroy(btfs_ino_cache);
 		return -ENOMEM;
 	}
 	
-	btfs_nl_sock = netlink_kernel_create(&init_net, NETLINK_BTFS, &cfg);
-	if (!btfs_nl_sock) {
-		pr_err("btfs: Failed to create netlink socket\n");
-		kmem_cache_destroy(btfs_inode_cachep);
-		return -ENOMEM;
+	if (register_filesystem(&btfs_type)) {
+		netlink_kernel_release(btfs_sock);
+		kmem_cache_destroy(btfs_ino_cache);
+		return -EBUSY;
 	}
 	
-	ret = register_filesystem(&btfs_fs_type);
-	if (ret) {
-		pr_err("btfs: Failed to register filesystem\n");
-		netlink_kernel_release(btfs_nl_sock);
-		kmem_cache_destroy(btfs_inode_cachep);
-		return ret;
-	}
-	
-	pr_info("btfs: Module loaded successfully\n");
+	pr_info("btfs: module loaded\n");
 	return 0;
 }
 
 static void __exit btfs_exit(void)
 {
-	pr_info("btfs: Unloading BTFS client module\n");
-	
-	unregister_filesystem(&btfs_fs_type);
-	
-	if (btfs_nl_sock) {
-		netlink_kernel_release(btfs_nl_sock);
-		btfs_nl_sock = NULL;
-	}
-	
+	unregister_filesystem(&btfs_type);
+	netlink_kernel_release(btfs_sock);
 	rcu_barrier();
-	kmem_cache_destroy(btfs_inode_cachep);
-	
-	pr_info("btfs: Module unloaded\n");
+	kmem_cache_destroy(btfs_ino_cache);
+	pr_info("btfs: module unloaded\n");
 }
 
 module_init(btfs_init);

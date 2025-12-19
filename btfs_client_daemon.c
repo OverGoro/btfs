@@ -1,656 +1,624 @@
-// btfs_client_daemon.c - Исправленная версия с hello-сообщением
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * BTFS Client Daemon - Netlink <-> Bluetooth bridge
+ * Similar to NFS mount helper daemon
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
-#include <pthread.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/socket.h>
-#include <sys/types.h>
-#include <linux/netlink.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
 #include <bluetooth/sdp.h>
 #include <bluetooth/sdp_lib.h>
-#include <stdarg.h>
-#include <time.h>
-
+#include <linux/netlink.h>
 #include "btfs_protocol.h"
 
 #define NETLINK_BTFS 31
-#define MAX_PENDING_REQUESTS 100
+#define MAX_PENDING 100
 
-typedef struct pending_request {
-    uint32_t sequence;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int completed;
-    btfs_response_t response;
-    char response_data[BTFS_MAX_DATA];
-    struct pending_request *next;
-} pending_request_t;
-
-static int bt_socket = -1;
-static int nl_socket = -1;
-static pthread_mutex_t bt_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pending_request_t *pending_requests = NULL;
-static uint32_t sequence_counter = 1;
-static volatile int running = 1;
-static uint32_t client_id = 0;
-
-void print_log(const char *format, ...) {
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    char timestamp[64];
-    strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S]", t);
-    
-    printf("%s ", timestamp);
-    va_list args;
-    va_start(args, format);
-    vprintf(format, args);
-    va_end(args);
-    printf("\n");
-    fflush(stdout);
-}
-
-// ============ PENDING REQUESTS ============
-
-pending_request_t *create_pending_request(uint32_t sequence) {
-    pending_request_t *req = malloc(sizeof(pending_request_t));
-    if (!req) return NULL;
-    
-    req->sequence = sequence;
-    req->completed = 0;
-    pthread_mutex_init(&req->mutex, NULL);
-    pthread_cond_init(&req->cond, NULL);
-    
-    pthread_mutex_lock(&pending_mutex);
-    req->next = pending_requests;
-    pending_requests = req;
-    pthread_mutex_unlock(&pending_mutex);
-    
-    return req;
-}
-
-pending_request_t *find_pending_request(uint32_t sequence) {
-    pthread_mutex_lock(&pending_mutex);
-    pending_request_t *req = pending_requests;
-    while (req) {
-        if (req->sequence == sequence) {
-            pthread_mutex_unlock(&pending_mutex);
-            return req;
-        }
-        req = req->next;
-    }
-    pthread_mutex_unlock(&pending_mutex);
-    return NULL;
-}
-
-void remove_pending_request(uint32_t sequence) {
-    pthread_mutex_lock(&pending_mutex);
-    pending_request_t *req = pending_requests;
-    pending_request_t *prev = NULL;
-    
-    while (req) {
-        if (req->sequence == sequence) {
-            if (prev) {
-                prev->next = req->next;
-            } else {
-                pending_requests = req->next;
-            }
-            pthread_mutex_destroy(&req->mutex);
-            pthread_cond_destroy(&req->cond);
-            free(req);
-            break;
-        }
-        prev = req;
-        req = req->next;
-    }
-    pthread_mutex_unlock(&pending_mutex);
-}
-
-// ============ BLUETOOTH COMMUNICATION ============
-
-int send_bt_request(uint32_t opcode, uint32_t flags, const void *data, 
-                    uint32_t data_len, uint32_t *sequence_out) {
-    btfs_header_t header;
-    
-    pthread_mutex_lock(&bt_mutex);
-    
-    header.opcode = opcode;
-    header.sequence = sequence_counter++;
-    header.client_id = client_id;
-    header.flags = flags;
-    header.data_len = data_len;
-    
-    *sequence_out = header.sequence;
-    
-    if (write(bt_socket, &header, sizeof(header)) != sizeof(header)) {
-        pthread_mutex_unlock(&bt_mutex);
-        return -EIO;
-    }
-    
-    if (data && data_len > 0) {
-        if (write(bt_socket, data, data_len) != data_len) {
-            pthread_mutex_unlock(&bt_mutex);
-            return -EIO;
-        }
-    }
-    
-    pthread_mutex_unlock(&bt_mutex);
-    return 0;
-}
-
-int wait_for_response(uint32_t sequence, btfs_response_t *response, 
-                      void *data_buffer, size_t buffer_size) {
-    pending_request_t *req = find_pending_request(sequence);
-    if (!req) return -EINVAL;
-    
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += 30;
-    
-    pthread_mutex_lock(&req->mutex);
-    
-    while (!req->completed && running) {
-        int ret = pthread_cond_timedwait(&req->cond, &req->mutex, &timeout);
-        if (ret == ETIMEDOUT) {
-            pthread_mutex_unlock(&req->mutex);
-            remove_pending_request(sequence);
-            return -ETIMEDOUT;
-        }
-    }
-    
-    if (!running) {
-        pthread_mutex_unlock(&req->mutex);
-        remove_pending_request(sequence);
-        return -EINTR;
-    }
-    
-    memcpy(response, &req->response, sizeof(btfs_response_t));
-    
-    if (data_buffer && buffer_size > 0 && req->response.data_len > 0) {
-        size_t copy_len = (req->response.data_len < buffer_size) ? 
-                          req->response.data_len : buffer_size;
-        memcpy(data_buffer, req->response_data, copy_len);
-    }
-    
-    pthread_mutex_unlock(&req->mutex);
-    remove_pending_request(sequence);
-    
-    return 0;
-}
-
-void *bt_receive_thread(void *arg) {
-    btfs_response_t response;
-    
-    print_log("BT receive thread started");
-    
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-    setsockopt(bt_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    while (running) {
-        ssize_t ret = read(bt_socket, &response, sizeof(response));
-        
-        if (ret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            if (running) print_log("ERROR: Failed to read response header: %s", strerror(errno));
-            break;
-        }
-        
-        if (ret == 0) {
-            print_log("Server closed connection");
-            break;
-        }
-        
-        if (ret != sizeof(response)) {
-            print_log("ERROR: Partial read of response header");
-            break;
-        }
-        
-        char *data_buffer = NULL;
-        if (response.data_len > 0) {
-            data_buffer = malloc(response.data_len);
-            if (!data_buffer) {
-                print_log("ERROR: Cannot allocate %u bytes for response", response.data_len);
-                break;
-            }
-            
-            ret = read(bt_socket, data_buffer, response.data_len);
-            if (ret != response.data_len) {
-                if (running) print_log("ERROR: Failed to read response data");
-                free(data_buffer);
-                break;
-            }
-        }
-        
-        pending_request_t *req = find_pending_request(response.sequence);
-        if (req) {
-            pthread_mutex_lock(&req->mutex);
-            memcpy(&req->response, &response, sizeof(response));
-            if (response.data_len > 0 && response.data_len <= BTFS_MAX_DATA) {
-                memcpy(req->response_data, data_buffer, response.data_len);
-            } else if (response.data_len > BTFS_MAX_DATA) {
-                print_log("WARNING: Response too large (%u bytes), truncating to %d", 
-                         response.data_len, BTFS_MAX_DATA);
-                memcpy(req->response_data, data_buffer, BTFS_MAX_DATA);
-                req->response.data_len = BTFS_MAX_DATA;
-            }
-            req->completed = 1;
-            pthread_cond_signal(&req->cond);
-            pthread_mutex_unlock(&req->mutex);
-        } else {
-            print_log("WARNING: Response for unknown sequence: %u", response.sequence);
-        }
-        
-        if (data_buffer) free(data_buffer);
-    }
-    
-    print_log("BT receive thread stopped");
-    return NULL;
-}
-
-
-// ============ NETLINK COMMUNICATION ============
-
+/* Netlink message format (must match kernel) */
 typedef struct {
-    uint32_t opcode;
-    uint32_t sequence;
-    int32_t result;
-    uint32_t data_len;
-    char data[0];
-} nl_message_t;
+	uint32_t op;
+	uint32_t seq;
+	int32_t res;
+	uint32_t len;
+	uint8_t data[0];
+} __attribute__((packed)) nl_msg_t;
 
-int send_netlink_response(int pid, uint32_t sequence, int32_t result, 
-                          const void *data, uint32_t data_len) {
-    struct sockaddr_nl dest_addr;
-    struct nlmsghdr *nlh;
-    struct msghdr msg;
-    struct iovec iov;
-    nl_message_t *nl_msg;
-    char *buf;
-    
-    size_t total_len = NLMSG_SPACE(sizeof(nl_message_t) + data_len);
-    buf = malloc(total_len);
-    if (!buf) return -ENOMEM;
-    
-    memset(buf, 0, total_len);
-    
-    nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_len = total_len;
-    nlh->nlmsg_pid = getpid();
-    nlh->nlmsg_flags = 0;
-    
-    nl_msg = (nl_message_t *)NLMSG_DATA(nlh);
-    nl_msg->opcode = 0;
-    nl_msg->sequence = sequence;
-    nl_msg->result = result;
-    nl_msg->data_len = data_len;
-    
-    if (data && data_len > 0) {
-        memcpy(nl_msg->data, data, data_len);
-    }
-    
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.nl_family = AF_NETLINK;
-    dest_addr.nl_pid = pid;
-    
-    iov.iov_base = buf;
-    iov.iov_len = nlh->nlmsg_len;
-    
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_name = &dest_addr;
-    msg.msg_namelen = sizeof(dest_addr);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    
-    int ret = sendmsg(nl_socket, &msg, 0);
-    free(buf);
-    
-    return (ret < 0) ? -errno : 0;
+/* Pending request tracking */
+typedef struct pending_req {
+	uint32_t seq;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	int done;
+	btfs_response_t rsp;
+	char data[BTFS_MAX_DATA];
+	struct pending_req *next;
+} pending_req_t;
+
+/* Global state */
+static int bt_sock = -1;
+static int nl_sock = -1;
+static pthread_mutex_t bt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pend_lock = PTHREAD_MUTEX_INITIALIZER;
+static pending_req_t *pending_head = NULL;
+static volatile int running = 1;
+
+void log_msg(const char *fmt, ...)
+{
+	va_list ap;
+	time_t now = time(NULL);
+	struct tm *tm = localtime(&now);
+	char ts[64];
+	
+	strftime(ts, sizeof(ts), "[%Y-%m-%d %H:%M:%S]", tm);
+	printf("%s ", ts);
+	
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	printf("\n");
+	fflush(stdout);
 }
 
-// НОВАЯ ФУНКЦИЯ: Отправить hello-сообщение модулю
-void send_hello_to_kernel() {
-    struct sockaddr_nl dest_addr;
-    struct nlmsghdr *nlh;
-    struct msghdr msg;
-    struct iovec iov;
-    char buf[NLMSG_SPACE(sizeof(nl_message_t))];
-    nl_message_t *hello_msg;
-    
-    memset(buf, 0, sizeof(buf));
-    
-    nlh = (struct nlmsghdr *)buf;
-    nlh->nlmsg_len = NLMSG_SPACE(sizeof(nl_message_t));
-    nlh->nlmsg_pid = getpid();
-    nlh->nlmsg_flags = 0;
-    nlh->nlmsg_type = NLMSG_DONE;
-    
-    hello_msg = (nl_message_t *)NLMSG_DATA(nlh);
-    hello_msg->opcode = 0;
-    hello_msg->sequence = 0;
-    hello_msg->result = 0;
-    hello_msg->data_len = 0;
-    
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.nl_family = AF_NETLINK;
-    dest_addr.nl_pid = 0; // Kernel
-    
-    iov.iov_base = buf;
-    iov.iov_len = nlh->nlmsg_len;
-    
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_name = &dest_addr;
-    msg.msg_namelen = sizeof(dest_addr);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    
-    if (sendmsg(nl_socket, &msg, 0) > 0) {
-        print_log("Registered with kernel module");
-    } else {
-        print_log("WARNING: Failed to send hello to kernel");
-    }
+/*
+ * Pending request management
+ */
+static pending_req_t *pending_add(uint32_t seq)
+{
+	pending_req_t *req = calloc(1, sizeof(*req));
+	if (!req)
+		return NULL;
+	
+	req->seq = seq;
+	pthread_mutex_init(&req->lock, NULL);
+	pthread_cond_init(&req->cond, NULL);
+	
+	pthread_mutex_lock(&pend_lock);
+	req->next = pending_head;
+	pending_head = req;
+	pthread_mutex_unlock(&pend_lock);
+	
+	return req;
 }
 
-void *netlink_thread(void *arg) {
-    struct sockaddr_nl src_addr;
-    struct nlmsghdr *nlh = NULL;
-    struct msghdr msg;
-    struct iovec iov;
-    char buffer[8192];
-    
-    print_log("Netlink thread started");
-    
-    // Установить таймаут для recvmsg
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-    setsockopt(nl_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    nlh = (struct nlmsghdr *)buffer;
-    
-    while (running) {
-        memset(&iov, 0, sizeof(iov));
-        iov.iov_base = buffer;
-        iov.iov_len = sizeof(buffer);
-        
-        memset(&msg, 0, sizeof(msg));
-        msg.msg_name = &src_addr;
-        msg.msg_namelen = sizeof(src_addr);
-        msg.msg_iov = &iov;
-        msg.msg_iovlen = 1;
-        
-        ssize_t ret = recvmsg(nl_socket, &msg, 0);
-        
-        if (ret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;  // Timeout - проверить running и продолжить
-            }
-            if (running) {
-                perror("Netlink recvmsg");
-            }
-            break;
-        }
-        
-        nl_message_t *nl_msg = (nl_message_t *)NLMSG_DATA(nlh);
-        int kernel_pid = nlh->nlmsg_pid;
-        
-        print_log("NL: Received opcode=%u, seq=%u, data_len=%u",
-                  nl_msg->opcode, nl_msg->sequence, nl_msg->data_len);
-        
-        uint32_t bt_sequence;
-        
-        int send_ret = send_bt_request(nl_msg->opcode, 0, nl_msg->data, 
-                                       nl_msg->data_len, &bt_sequence);
-        if (send_ret < 0) {
-            print_log("ERROR: Failed to send BT request: %d", send_ret);
-            send_netlink_response(kernel_pid, nl_msg->sequence, send_ret, NULL, 0);
-            continue;
-        }
-        
-        pending_request_t *pending = create_pending_request(bt_sequence);
-        if (!pending) {
-            print_log("ERROR: Failed to create pending request");
-            send_netlink_response(kernel_pid, nl_msg->sequence, -ENOMEM, NULL, 0);
-            continue;
-        }
-        
-        btfs_response_t bt_response;
-        char response_data[BTFS_MAX_DATA];
-        
-        int wait_ret = wait_for_response(bt_sequence, &bt_response, 
-                                         response_data, sizeof(response_data));
-        if (wait_ret < 0) {
-            print_log("ERROR: Failed to get BT response: %d", wait_ret);
-            send_netlink_response(kernel_pid, nl_msg->sequence, wait_ret, NULL, 0);
-            continue;
-        }
-        
-        send_netlink_response(kernel_pid, nl_msg->sequence, bt_response.result,
-                             response_data, bt_response.data_len);
-        
-        print_log("NL: Sent response seq=%u, result=%d, data_len=%u",
-                  nl_msg->sequence, bt_response.result, bt_response.data_len);
-    }
-    
-    print_log("Netlink thread stopped");
-    return NULL;
+static pending_req_t *pending_find(uint32_t seq)
+{
+	pending_req_t *req;
+	
+	pthread_mutex_lock(&pend_lock);
+	for (req = pending_head; req; req = req->next) {
+		if (req->seq == seq) {
+			pthread_mutex_unlock(&pend_lock);
+			return req;
+		}
+	}
+	pthread_mutex_unlock(&pend_lock);
+	return NULL;
 }
 
-
-// ============ SERVER CONNECTION ============
-
-int find_server_and_connect(const char *server_mac, const char *server_name) {
-    bdaddr_t server_addr;
-    uint8_t channel = 1;
-    
-    if (server_mac) {
-        str2ba(server_mac, &server_addr);
-    } else {
-        print_log("ERROR: Server MAC required");
-        return -1;
-    }
-    
-    uint32_t service_uuid_int[] = {0x01110000, 0x00100000, 0x80000080, 0xFB349B5F};
-    uuid_t svc_uuid;
-    sdp_uuid128_create(&svc_uuid, &service_uuid_int);
-    
-    sdp_session_t *session = sdp_connect(BDADDR_ANY, &server_addr, SDP_RETRY_IF_BUSY);
-    if (session) {
-        print_log("Connected to SDP server");
-        
-        sdp_list_t *search_list = sdp_list_append(NULL, &svc_uuid);
-        sdp_list_t *response_list = NULL;
-        uint32_t range = 0x0000ffff;
-        sdp_list_t *attrid_list = sdp_list_append(NULL, &range);
-        
-        if (sdp_service_search_attr_req(session, search_list,
-                                       SDP_ATTR_REQ_RANGE, attrid_list,
-                                       &response_list) == 0 && response_list) {
-            sdp_list_t *r = response_list;
-            for (; r; r = r->next) {
-                sdp_record_t *rec = (sdp_record_t*)r->data;
-                sdp_list_t *proto_list;
-                
-                if (sdp_get_access_protos(rec, &proto_list) == 0) {
-                    sdp_list_t *p = proto_list;
-                    for (; p; p = p->next) {
-                        sdp_list_t *pds = (sdp_list_t*)p->data;
-                        for (; pds; pds = pds->next) {
-                            sdp_data_t *d = (sdp_data_t*)pds->data;
-                            int proto = 0;
-                            for (; d; d = d->next) {
-                                switch (d->dtd) {
-                                    case SDP_UUID16:
-                                    case SDP_UUID32:
-                                    case SDP_UUID128:
-                                        proto = sdp_uuid_to_proto(&d->val.uuid);
-                                        break;
-                                    case SDP_UINT8:
-                                        if (proto == RFCOMM_UUID) {
-                                            channel = d->val.uint8;
-                                            print_log("Found BTFS on channel %d", channel);
-                                        }
-                                        break;
-                                }
-                            }
-                        }
-                    }
-                    sdp_list_free(proto_list, 0);
-                }
-                sdp_record_free(rec);
-            }
-            sdp_list_free(response_list, 0);
-        }
-        
-        sdp_list_free(search_list, 0);
-        sdp_list_free(attrid_list, 0);
-        sdp_close(session);
-    }
-    
-    print_log("Connecting to server on channel %d...", channel);
-    
-    int sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
-    if (sock < 0) {
-        perror("Socket creation failed");
-        return -1;
-    }
-    
-    struct sockaddr_rc addr = {0};
-    addr.rc_family = AF_BLUETOOTH;
-    addr.rc_channel = channel;
-    bacpy(&addr.rc_bdaddr, &server_addr);
-    
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("Connection failed");
-        close(sock);
-        return -1;
-    }
-    
-    print_log("Connected to BTFS server successfully");
-    
-    client_id = getpid();
-    
-    return sock;
+static void pending_remove(uint32_t seq)
+{
+	pending_req_t *req, *prev = NULL;
+	
+	pthread_mutex_lock(&pend_lock);
+	for (req = pending_head; req; prev = req, req = req->next) {
+		if (req->seq == seq) {
+			if (prev)
+				prev->next = req->next;
+			else
+				pending_head = req->next;
+			
+			pthread_mutex_destroy(&req->lock);
+			pthread_cond_destroy(&req->cond);
+			free(req);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&pend_lock);
 }
 
-// ============ MAIN ============
-
-void signal_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) {
-        print_log("Received shutdown signal");
-        running = 0;
-    }
+/*
+ * Bluetooth communication
+ */
+static int bt_send_request(uint32_t opcode, uint32_t seq, 
+			   const void *data, uint32_t len)
+{
+	btfs_header_t hdr;
+	
+	pthread_mutex_lock(&bt_lock);
+	
+	hdr.opcode = opcode;
+	hdr.sequence = seq;
+	hdr.client_id = getpid();
+	hdr.flags = 0;
+	hdr.data_len = len;
+	
+	if (write(bt_sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+		pthread_mutex_unlock(&bt_lock);
+		return -EIO;
+	}
+	
+	if (data && len > 0) {
+		if (write(bt_sock, data, len) != len) {
+			pthread_mutex_unlock(&bt_lock);
+			return -EIO;
+		}
+	}
+	
+	pthread_mutex_unlock(&bt_lock);
+	return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <server_mac_address>\n", argv[0]);
-        return 1;
-    }
-    
-    const char *server_mac = argv[1];
-    
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);
-    
-    print_log("===================================================");
-    print_log("  BTFS CLIENT DAEMON");
-    print_log("===================================================");
-    print_log("Server MAC: %s", server_mac);
-    
-    bt_socket = find_server_and_connect(server_mac, NULL);
-    if (bt_socket < 0) {
-        print_log("ERROR: Failed to connect to server");
-        return 1;
-    }
-    
-    nl_socket = socket(AF_NETLINK, SOCK_RAW, NETLINK_BTFS);
-    if (nl_socket < 0) {
-        perror("Netlink socket creation failed");
-        print_log("Make sure kernel module is loaded: sudo insmod btfs_client_fs.ko");
-        close(bt_socket);
-        return 1;
-    }
-    
-    struct sockaddr_nl src_addr;
-    memset(&src_addr, 0, sizeof(src_addr));
-    src_addr.nl_family = AF_NETLINK;
-    src_addr.nl_pid = getpid();
-    
-    if (bind(nl_socket, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
-        perror("Netlink bind failed");
-        close(nl_socket);
-        close(bt_socket);
-        return 1;
-    }
-    
-    print_log("Netlink socket created and bound");
-    
-    // ВАЖНО: Отправить hello-сообщение модулю
-    send_hello_to_kernel();
-    
-    print_log("===================================================\n");
-    
-    pthread_t bt_thread, nl_thread;
-    
-    if (pthread_create(&bt_thread, NULL, bt_receive_thread, NULL) != 0) {
-        perror("Failed to create BT thread");
-        close(nl_socket);
-        close(bt_socket);
-        return 1;
-    }
-    
-    if (pthread_create(&nl_thread, NULL, netlink_thread, NULL) != 0) {
-        perror("Failed to create Netlink thread");
-        running = 0;
-        pthread_join(bt_thread, NULL);
-        close(nl_socket);
-        close(bt_socket);
-        return 1;
-    }
-    
-    print_log("Client daemon running. Press Ctrl+C to stop.");
-    
-    while (running) {
-        sleep(10);
-        
-        uint32_t seq;
-        if (send_bt_request(BTFS_OP_PING, 0, NULL, 0, &seq) == 0) {
-            pending_request_t *pending = create_pending_request(seq);
-            if (pending) {
-                btfs_response_t resp;
-                if (wait_for_response(seq, &resp, NULL, 0) < 0) {
-                    print_log("WARNING: Ping timeout");
-                }
-            }
-        }
-    }
-    
-    print_log("\n===================================================");
-    print_log("Shutting down daemon...");
-    
-    pthread_join(bt_thread, NULL);
-    pthread_join(nl_thread, NULL);
-    
-    close(nl_socket);
-    close(bt_socket);
-    
-    pthread_mutex_lock(&pending_mutex);
-    pending_request_t *req = pending_requests;
-    while (req) {
-        pending_request_t *next = req->next;
-        pthread_mutex_destroy(&req->mutex);
-        pthread_cond_destroy(&req->cond);
-        free(req);
-        req = next;
-    }
-    pthread_mutex_unlock(&pending_mutex);
-    
-    print_log("Daemon stopped");
-    print_log("===================================================");
-    
-    return 0;
+static int bt_wait_response(uint32_t seq, btfs_response_t *rsp,
+			    void *data, size_t datalen)
+{
+	pending_req_t *req = pending_find(seq);
+	struct timespec timeout;
+	int ret;
+	
+	if (!req)
+		return -EINVAL;
+	
+	clock_gettime(CLOCK_REALTIME, &timeout);
+	timeout.tv_sec += 30;
+	
+	pthread_mutex_lock(&req->lock);
+	while (!req->done && running) {
+		ret = pthread_cond_timedwait(&req->cond, &req->lock, &timeout);
+		if (ret == ETIMEDOUT) {
+			pthread_mutex_unlock(&req->lock);
+			return -ETIMEDOUT;
+		}
+	}
+	
+	if (!running) {
+		pthread_mutex_unlock(&req->lock);
+		return -EINTR;
+	}
+	
+	memcpy(rsp, &req->rsp, sizeof(*rsp));
+	if (data && datalen && req->rsp.data_len > 0) {
+		size_t copy = req->rsp.data_len < datalen ? 
+			      req->rsp.data_len : datalen;
+		memcpy(data, req->data, copy);
+	}
+	
+	pthread_mutex_unlock(&req->lock);
+	return 0;
+}
+
+/*
+ * Bluetooth receive thread
+ */
+static void *bt_recv_thread(void *arg)
+{
+	btfs_response_t rsp;
+	pending_req_t *req;
+	
+	log_msg("BT receive thread started");
+	
+	struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+	setsockopt(bt_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	
+	while (running) {
+		ssize_t n = read(bt_sock, &rsp, sizeof(rsp));
+		
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			if (running)
+				log_msg("BT read error: %s", strerror(errno));
+			break;
+		}
+		
+		if (n == 0) {
+			log_msg("BT connection closed");
+			break;
+		}
+		
+		if (n != sizeof(rsp)) {
+			log_msg("BT partial read");
+			continue;
+		}
+		
+		req = pending_find(rsp.sequence);
+		if (!req) {
+			log_msg("Unknown sequence: %u", rsp.sequence);
+			continue;
+		}
+		
+		pthread_mutex_lock(&req->lock);
+		memcpy(&req->rsp, &rsp, sizeof(rsp));
+		
+		if (rsp.data_len > 0) {
+			size_t toread = rsp.data_len < BTFS_MAX_DATA ?
+					rsp.data_len : BTFS_MAX_DATA;
+			
+			n = read(bt_sock, req->data, toread);
+			if (n != toread) {
+				log_msg("BT data read error");
+				req->rsp.result = -EIO;
+			}
+		}
+		
+		req->done = 1;
+		pthread_cond_signal(&req->cond);
+		pthread_mutex_unlock(&req->lock);
+	}
+	
+	log_msg("BT receive thread stopped");
+	return NULL;
+}
+
+/*
+ * Netlink communication
+ */
+static int nl_send_response(uint32_t pid, uint32_t seq, int32_t res,
+			    const void *data, uint32_t len)
+{
+	struct sockaddr_nl dest;
+	struct nlmsghdr *nlh;
+	nl_msg_t *msg;
+	struct msghdr mh;
+	struct iovec iov;
+	char *buf;
+	size_t total;
+	int ret;
+	
+	total = NLMSG_SPACE(sizeof(nl_msg_t) + len);
+	buf = malloc(total);
+	if (!buf)
+		return -ENOMEM;
+	
+	memset(buf, 0, total);
+	nlh = (struct nlmsghdr *)buf;
+	nlh->nlmsg_len = total;
+	nlh->nlmsg_pid = getpid();
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_type = NLMSG_DONE;
+	
+	msg = (nl_msg_t *)NLMSG_DATA(nlh);
+	msg->op = 0;
+	msg->seq = seq;
+	msg->res = res;
+	msg->len = len;
+	
+	if (data && len)
+		memcpy(msg->data, data, len);
+	
+	memset(&dest, 0, sizeof(dest));
+	dest.nl_family = AF_NETLINK;
+	dest.nl_pid = pid;
+	
+	iov.iov_base = buf;
+	iov.iov_len = nlh->nlmsg_len;
+	
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_name = &dest;
+	mh.msg_namelen = sizeof(dest);
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	
+	ret = sendmsg(nl_sock, &mh, 0);
+	free(buf);
+	
+	return ret < 0 ? -errno : 0;
+}
+
+static void nl_send_hello(void)
+{
+	struct sockaddr_nl dest;
+	struct nlmsghdr *nlh;
+	nl_msg_t *msg;
+	struct msghdr mh;
+	struct iovec iov;
+	char buf[NLMSG_SPACE(sizeof(nl_msg_t))];
+	
+	memset(buf, 0, sizeof(buf));
+	nlh = (struct nlmsghdr *)buf;
+	nlh->nlmsg_len = NLMSG_SPACE(sizeof(nl_msg_t));
+	nlh->nlmsg_pid = getpid();
+	nlh->nlmsg_type = NLMSG_DONE;
+	
+	msg = (nl_msg_t *)NLMSG_DATA(nlh);
+	msg->op = 0;
+	msg->seq = 0;
+	msg->res = 0;
+	msg->len = 0;
+	
+	memset(&dest, 0, sizeof(dest));
+	dest.nl_family = AF_NETLINK;
+	dest.nl_pid = 0; // kernel
+	
+	iov.iov_base = buf;
+	iov.iov_len = nlh->nlmsg_len;
+	
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_name = &dest;
+	mh.msg_namelen = sizeof(dest);
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	
+	if (sendmsg(nl_sock, &mh, 0) > 0)
+		log_msg("Registered with kernel module");
+}
+
+/*
+ * Netlink receive thread
+ */
+static void *nl_recv_thread(void *arg)
+{
+	struct sockaddr_nl src;
+	struct nlmsghdr *nlh;
+	nl_msg_t *msg;
+	struct msghdr mh;
+	struct iovec iov;
+	char buf[8192];
+	pending_req_t *pend;
+	btfs_response_t brsp;
+	char rdata[BTFS_MAX_DATA];
+	uint32_t bt_seq;
+	int ret;
+	
+	log_msg("Netlink thread started");
+	
+	struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+	setsockopt(nl_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	
+	nlh = (struct nlmsghdr *)buf;
+	
+	while (running) {
+		memset(&iov, 0, sizeof(iov));
+		iov.iov_base = buf;
+		iov.iov_len = sizeof(buf);
+		
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_name = &src;
+		mh.msg_namelen = sizeof(src);
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+		
+		ssize_t n = recvmsg(nl_sock, &mh, 0);
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			if (running)
+				perror("netlink recvmsg");
+			break;
+		}
+		
+		msg = (nl_msg_t *)NLMSG_DATA(nlh);
+		
+		log_msg("NL: op=%u seq=%u len=%u", msg->op, msg->seq, msg->len);
+		
+		/* Forward to Bluetooth server */
+		bt_seq = msg->seq;
+		pend = pending_add(bt_seq);
+		if (!pend) {
+			nl_send_response(nlh->nlmsg_pid, msg->seq, -ENOMEM, NULL, 0);
+			continue;
+		}
+		
+		ret = bt_send_request(msg->op, bt_seq, msg->data, msg->len);
+		if (ret < 0) {
+			pending_remove(bt_seq);
+			nl_send_response(nlh->nlmsg_pid, msg->seq, ret, NULL, 0);
+			continue;
+		}
+		
+		ret = bt_wait_response(bt_seq, &brsp, rdata, sizeof(rdata));
+		if (ret < 0) {
+			pending_remove(bt_seq);
+			nl_send_response(nlh->nlmsg_pid, msg->seq, ret, NULL, 0);
+			continue;
+		}
+		
+		nl_send_response(nlh->nlmsg_pid, msg->seq, brsp.result,
+				 rdata, brsp.data_len);
+		
+		pending_remove(bt_seq);
+		
+		log_msg("NL: response sent seq=%u res=%d len=%u",
+			msg->seq, brsp.result, brsp.data_len);
+	}
+	
+	log_msg("Netlink thread stopped");
+	return NULL;
+}
+
+/*
+ * Bluetooth connection
+ */
+static int bt_connect(const char *mac_addr)
+{
+	struct sockaddr_rc addr = {0};
+	bdaddr_t bdaddr;
+	int sock, channel = 1;
+	
+	/* SDP lookup */
+	str2ba(mac_addr, &bdaddr);
+	
+	uint32_t svc_uuid[] = {0x01110000, 0x00100000, 0x80000080, 0xFB349B5F};
+	uuid_t svc;
+	sdp_uuid128_create(&svc, &svc_uuid);
+	
+	sdp_session_t *session = sdp_connect(BDADDR_ANY, &bdaddr, SDP_RETRY_IF_BUSY);
+	if (session) {
+		sdp_list_t *search = sdp_list_append(NULL, &svc);
+		sdp_list_t *response = NULL;
+		uint32_t range = 0x0000ffff;
+		sdp_list_t *attrid = sdp_list_append(NULL, &range);
+		
+		if (sdp_service_search_attr_req(session, search,
+						SDP_ATTR_REQ_RANGE,
+						attrid, &response) == 0) {
+			for (sdp_list_t *r = response; r; r = r->next) {
+				sdp_record_t *rec = r->data;
+				sdp_list_t *proto;
+				
+				if (sdp_get_access_protos(rec, &proto) == 0) {
+					for (sdp_list_t *p = proto; p; p = p->next) {
+						sdp_list_t *pds = p->data;
+						for (; pds; pds = pds->next) {
+							sdp_data_t *d = pds->data;
+							int pr = 0;
+							for (; d; d = d->next) {
+								if (d->dtd == SDP_UUID16 ||
+								    d->dtd == SDP_UUID32 ||
+								    d->dtd == SDP_UUID128)
+									pr = sdp_uuid_to_proto(&d->val.uuid);
+								else if (d->dtd == SDP_UINT8 && pr == RFCOMM_UUID)
+									channel = d->val.uint8;
+							}
+						}
+					}
+					sdp_list_free(proto, 0);
+				}
+			}
+			sdp_list_free(response, 0);
+		}
+		
+		sdp_list_free(search, 0);
+		sdp_list_free(attrid, 0);
+		sdp_close(session);
+	}
+	
+	log_msg("Connecting to %s channel %d", mac_addr, channel);
+	
+	sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+	if (sock < 0) {
+		perror("socket");
+		return -1;
+	}
+	
+	addr.rc_family = AF_BLUETOOTH;
+	addr.rc_channel = channel;
+	bacpy(&addr.rc_bdaddr, &bdaddr);
+	
+	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		perror("connect");
+		close(sock);
+		return -1;
+	}
+	
+	log_msg("Connected to BTFS server");
+	return sock;
+}
+
+/*
+ * Signal handler
+ */
+static void sighandler(int sig)
+{
+	if (sig == SIGINT || sig == SIGTERM) {
+		log_msg("Received signal %d", sig);
+		running = 0;
+	}
+}
+
+/*
+ * Main
+ */
+int main(int argc, char **argv)
+{
+	struct sockaddr_nl local;
+	pthread_t bt_thread, nl_thread;
+	
+	if (argc != 2) {
+		fprintf(stderr, "Usage: %s <server_mac>\n", argv[0]);
+		return 1;
+	}
+	
+	signal(SIGINT, sighandler);
+	signal(SIGTERM, sighandler);
+	signal(SIGPIPE, SIG_IGN);
+	
+	log_msg("==============================================");
+	log_msg("  BTFS Client Daemon");
+	log_msg("==============================================");
+	log_msg("Server: %s", argv[1]);
+	
+	/* Connect to Bluetooth server */
+	bt_sock = bt_connect(argv[1]);
+	if (bt_sock < 0) {
+		log_msg("Failed to connect to server");
+		return 1;
+	}
+	
+	/* Create netlink socket */
+	nl_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_BTFS);
+	if (nl_sock < 0) {
+		perror("netlink socket");
+		log_msg("Make sure kernel module is loaded:");
+		log_msg("  sudo insmod btfs_client_fs.ko");
+		close(bt_sock);
+		return 1;
+	}
+	
+	memset(&local, 0, sizeof(local));
+	local.nl_family = AF_NETLINK;
+	local.nl_pid = getpid();
+	
+	if (bind(nl_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+		perror("netlink bind");
+		close(nl_sock);
+		close(bt_sock);
+		return 1;
+	}
+	
+	log_msg("Netlink socket bound");
+	
+	/* Send hello to kernel */
+	nl_send_hello();
+	
+	log_msg("==============================================\n");
+	
+	/* Start threads */
+	if (pthread_create(&bt_thread, NULL, bt_recv_thread, NULL) != 0) {
+		perror("pthread_create bt");
+		close(nl_sock);
+		close(bt_sock);
+		return 1;
+	}
+	
+	if (pthread_create(&nl_thread, NULL, nl_recv_thread, NULL) != 0) {
+		perror("pthread_create nl");
+		running = 0;
+		pthread_join(bt_thread, NULL);
+		close(nl_sock);
+		close(bt_sock);
+		return 1;
+	}
+	
+	log_msg("Daemon running. Press Ctrl+C to stop.");
+	
+	/* Wait for threads */
+	pthread_join(bt_thread, NULL);
+	pthread_join(nl_thread, NULL);
+	
+	/* Cleanup */
+	close(nl_sock);
+	close(bt_sock);
+	
+	pending_req_t *req;
+	while ((req = pending_head)) {
+		pending_head = req->next;
+		pthread_mutex_destroy(&req->lock);
+		pthread_cond_destroy(&req->cond);
+		free(req);
+	}
+	
+	log_msg("==============================================");
+	log_msg("Daemon stopped");
+	log_msg("==============================================");
+	
+	return 0;
 }
