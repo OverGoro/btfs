@@ -418,21 +418,48 @@ static int btfs_release(struct inode *i, struct file *f) {
     return 0;
 }
 
+static void btfs_destroy_inode_cache(void) {
+    if (inode_cache) {
+        // КРИТИЧНО: принудительно сбросить все объекты перед уничтожением
+        kmem_cache_shrink(inode_cache);
+        
+        // Попытка уничтожить кэш
+        kmem_cache_destroy(inode_cache);
+        inode_cache = NULL;
+    }
+}
+
 static void btfs_evict_inode(struct inode *inode) {
     struct btfs_inode_info *info = BTFS_I(inode);
     
+    // ВАЖНО: сначала очистить страницы
     truncate_inode_pages_final(&inode->i_data);
-    clear_inode(inode);
     
+    // ИСПРАВЛЕНО: закрыть дескриптор ДО clear_inode
     if (info->fh) {
-        if (!atomic_read(&daemon_connected) || atomic_read(&shutting_down)) {
-            pr_debug("btfs: Inode evicted with leaked fh=%llu (daemon disconnected)\n", 
-                    info->fh);
-        } else {
-            pr_warn("btfs: Inode evicted with open fh=%llu\n", info->fh);
+        if (atomic_read(&daemon_connected) && !atomic_read(&shutting_down)) {
+            btfs_rw_req_t req;
+            uint32_t seq;
+            int32_t res;
+            
+            req.file_handle = info->fh;
+            // Пытаемся закрыть, но с очень коротким таймаутом
+            if (send_nl(BTFS_OP_CLOSE, &req, sizeof(uint64_t), &seq) == 0) {
+                pending_t *pend = create_pend(seq);
+                if (pend) {
+                    // Таймаут всего 500мс для evict
+                    wait_event_timeout(pend->wait, 
+                                      atomic_read(&pend->done), 
+                                      msecs_to_jiffies(500));
+                    remove_pend(seq);
+                }
+            }
         }
         info->fh = 0;
     }
+    
+    // ВАЖНО: clear_inode должен быть последним
+    clear_inode(inode);
 }
 
 static ssize_t btfs_read(struct file *f, char __user *buf, size_t len, loff_t *off) {
@@ -945,9 +972,17 @@ static void btfs_free_inode(struct inode *i) {
 }
 
 static void btfs_put_super(struct super_block *sb) {
-    pr_info("btfs: Superblock cleanup\n");
+    pr_info("btfs: put_super called\n");
+    
+    // Разбудить все ожидающие запросы
     abort_all_pending();
+    
+    // НОВОЕ: дать время на завершение операций
+    msleep(100);
+    
+    pr_info("btfs: put_super completed\n");
 }
+
 
 static const struct super_operations btfs_super_ops = {
     .alloc_inode = btfs_alloc_inode,
@@ -1067,23 +1102,36 @@ static int __init btfs_init(void) {
 static void __exit btfs_exit(void) {
     pending_t *p, *next;
     unsigned long flags;
+    int retry_count = 0;
     
     pr_info("btfs: Shutting down module\n");
     
+    // 1. Установить флаги остановки
     atomic_set(&shutting_down, 1);
     atomic_set(&daemon_connected, 0);
     
+    // 2. Отменить регистрацию файловой системы
+    // Это НЕ размонтирует существующие точки монтирования!
     unregister_filesystem(&btfs_fs);
+    pr_info("btfs: Filesystem unregistered\n");
     
+    // 3. Разбудить все ожидающие запросы
     abort_all_pending();
     
-    msleep(1000);
-    
+    // 4. Закрыть Netlink socket
     if (nl_sock) {
+        mutex_lock(&nl_mtx);
         netlink_kernel_release(nl_sock);
         nl_sock = NULL;
+        daemon_pid = 0;
+        mutex_unlock(&nl_mtx);
+        pr_info("btfs: Netlink socket closed\n");
     }
     
+    // 5. Подождать завершения RCU операций
+    synchronize_rcu();
+    
+    // 6. Очистить все pending запросы
     spin_lock_irqsave(&pend_lock, flags);
     p = pend_head;
     pend_head = NULL;
@@ -1096,15 +1144,39 @@ static void __exit btfs_exit(void) {
         kfree(p);
         p = next;
     }
+    pr_info("btfs: Pending requests cleared\n");
     
-    rcu_barrier();
-    
-    if (inode_cache) {
-        kmem_cache_destroy(inode_cache);
-        inode_cache = NULL;
+    // 7. КРИТИЧНО: подождать пока все inode будут освобождены
+    // Попробовать несколько раз с увеличивающимся таймаутом
+    while (retry_count < 10) {
+        // Принудительно запустить сборщик мусора
+        synchronize_rcu();
+        rcu_barrier();
+        
+        // Попытаться уменьшить кэш
+        if (inode_cache) {
+            kmem_cache_shrink(inode_cache);
+            
+            // Попробовать уничтожить
+            kmem_cache_destroy(inode_cache);
+            inode_cache = NULL;
+            
+            pr_info("btfs: Inode cache destroyed\n");
+            break;
+        }
+        
+        // Если не получилось - подождать еще
+        retry_count++;
+        pr_warn("btfs: Waiting for inode cache cleanup (attempt %d/10)\n", retry_count);
+        msleep(200);
     }
     
-    pr_info("btfs: Module unloaded cleanly\n");
+    if (retry_count >= 10) {
+        pr_err("btfs: WARNING - inode cache may still have active objects!\n");
+        pr_err("btfs: This may cause 'used by 2' - ensure filesystem is unmounted\n");
+    }
+    
+    pr_info("btfs: Module unloaded\n");
 }
 
 module_init(btfs_init);
