@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * BTFS Client Daemon - Netlink <-> Bluetooth bridge
- * Similar to NFS mount helper daemon
+ * BTFS Client Daemon - Fixed netlink communication
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdarg.h>
+#include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -21,7 +20,7 @@
 #include "btfs_protocol.h"
 
 #define NETLINK_BTFS 31
-#define MAX_PENDING 100
+#define MAX_MSG_SIZE 8192
 
 /* Netlink message format (must match kernel) */
 typedef struct {
@@ -34,7 +33,9 @@ typedef struct {
 
 /* Pending request tracking */
 typedef struct pending_req {
-	uint32_t seq;
+	uint32_t nl_seq;  // netlink sequence
+	uint32_t bt_seq;  // bluetooth sequence  
+	uint32_t nl_pid;  // netlink sender PID
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
 	int done;
@@ -50,6 +51,7 @@ static pthread_mutex_t bt_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t pend_lock = PTHREAD_MUTEX_INITIALIZER;
 static pending_req_t *pending_head = NULL;
 static volatile int running = 1;
+static uint32_t bt_seq_gen = 1;
 
 void log_msg(const char *fmt, ...)
 {
@@ -71,13 +73,15 @@ void log_msg(const char *fmt, ...)
 /*
  * Pending request management
  */
-static pending_req_t *pending_add(uint32_t seq)
+static pending_req_t *pending_add(uint32_t nl_seq, uint32_t nl_pid, uint32_t bt_seq)
 {
 	pending_req_t *req = calloc(1, sizeof(*req));
 	if (!req)
 		return NULL;
 	
-	req->seq = seq;
+	req->nl_seq = nl_seq;
+	req->nl_pid = nl_pid;
+	req->bt_seq = bt_seq;
 	pthread_mutex_init(&req->lock, NULL);
 	pthread_cond_init(&req->cond, NULL);
 	
@@ -89,13 +93,13 @@ static pending_req_t *pending_add(uint32_t seq)
 	return req;
 }
 
-static pending_req_t *pending_find(uint32_t seq)
+static pending_req_t *pending_find_by_bt(uint32_t bt_seq)
 {
 	pending_req_t *req;
 	
 	pthread_mutex_lock(&pend_lock);
 	for (req = pending_head; req; req = req->next) {
-		if (req->seq == seq) {
+		if (req->bt_seq == bt_seq) {
 			pthread_mutex_unlock(&pend_lock);
 			return req;
 		}
@@ -104,13 +108,13 @@ static pending_req_t *pending_find(uint32_t seq)
 	return NULL;
 }
 
-static void pending_remove(uint32_t seq)
+static void pending_remove(uint32_t bt_seq)
 {
 	pending_req_t *req, *prev = NULL;
 	
 	pthread_mutex_lock(&pend_lock);
 	for (req = pending_head; req; prev = req, req = req->next) {
-		if (req->seq == seq) {
+		if (req->bt_seq == bt_seq) {
 			if (prev)
 				prev->next = req->next;
 			else
@@ -147,51 +151,13 @@ static int bt_send_request(uint32_t opcode, uint32_t seq,
 	}
 	
 	if (data && len > 0) {
-		if (write(bt_sock, data, len) != len) {
+		if (write(bt_sock, data, len) != (ssize_t)len) {
 			pthread_mutex_unlock(&bt_lock);
 			return -EIO;
 		}
 	}
 	
 	pthread_mutex_unlock(&bt_lock);
-	return 0;
-}
-
-static int bt_wait_response(uint32_t seq, btfs_response_t *rsp,
-			    void *data, size_t datalen)
-{
-	pending_req_t *req = pending_find(seq);
-	struct timespec timeout;
-	int ret;
-	
-	if (!req)
-		return -EINVAL;
-	
-	clock_gettime(CLOCK_REALTIME, &timeout);
-	timeout.tv_sec += 30;
-	
-	pthread_mutex_lock(&req->lock);
-	while (!req->done && running) {
-		ret = pthread_cond_timedwait(&req->cond, &req->lock, &timeout);
-		if (ret == ETIMEDOUT) {
-			pthread_mutex_unlock(&req->lock);
-			return -ETIMEDOUT;
-		}
-	}
-	
-	if (!running) {
-		pthread_mutex_unlock(&req->lock);
-		return -EINTR;
-	}
-	
-	memcpy(rsp, &req->rsp, sizeof(*rsp));
-	if (data && datalen && req->rsp.data_len > 0) {
-		size_t copy = req->rsp.data_len < datalen ? 
-			      req->rsp.data_len : datalen;
-		memcpy(data, req->data, copy);
-	}
-	
-	pthread_mutex_unlock(&req->lock);
 	return 0;
 }
 
@@ -229,9 +195,9 @@ static void *bt_recv_thread(void *arg)
 			continue;
 		}
 		
-		req = pending_find(rsp.sequence);
+		req = pending_find_by_bt(rsp.sequence);
 		if (!req) {
-			log_msg("Unknown sequence: %u", rsp.sequence);
+			log_msg("Unknown BT sequence: %u", rsp.sequence);
 			continue;
 		}
 		
@@ -243,7 +209,7 @@ static void *bt_recv_thread(void *arg)
 					rsp.data_len : BTFS_MAX_DATA;
 			
 			n = read(bt_sock, req->data, toread);
-			if (n != toread) {
+			if (n != (ssize_t)toread) {
 				log_msg("BT data read error");
 				req->rsp.result = -EIO;
 			}
@@ -259,96 +225,56 @@ static void *bt_recv_thread(void *arg)
 }
 
 /*
- * Netlink communication
+ * Netlink - send response back to kernel
  */
-static int nl_send_response(uint32_t pid, uint32_t seq, int32_t res,
-			    const void *data, uint32_t len)
+static int nl_send_reply(uint32_t dst_pid, uint32_t seq, int32_t result,
+			 const void *data, uint32_t datalen)
 {
 	struct sockaddr_nl dest;
 	struct nlmsghdr *nlh;
 	nl_msg_t *msg;
-	struct msghdr mh;
-	struct iovec iov;
-	char *buf;
+	char buf[MAX_MSG_SIZE];
 	size_t total;
-	int ret;
 	
-	total = NLMSG_SPACE(sizeof(nl_msg_t) + len);
-	buf = malloc(total);
-	if (!buf)
-		return -ENOMEM;
+	if (datalen > BTFS_MAX_DATA)
+		datalen = BTFS_MAX_DATA;
+	
+	total = NLMSG_SPACE(sizeof(nl_msg_t) + datalen);
+	if (total > sizeof(buf)) {
+		log_msg("Message too large: %zu", total);
+		return -EMSGSIZE;
+	}
 	
 	memset(buf, 0, total);
+	
 	nlh = (struct nlmsghdr *)buf;
-	nlh->nlmsg_len = total;
-	nlh->nlmsg_pid = getpid();
-	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(nl_msg_t) + datalen);
 	nlh->nlmsg_type = NLMSG_DONE;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = seq;
+	nlh->nlmsg_pid = getpid();
 	
 	msg = (nl_msg_t *)NLMSG_DATA(nlh);
 	msg->op = 0;
 	msg->seq = seq;
-	msg->res = res;
-	msg->len = len;
+	msg->res = result;
+	msg->len = datalen;
 	
-	if (data && len)
-		memcpy(msg->data, data, len);
-	
-	memset(&dest, 0, sizeof(dest));
-	dest.nl_family = AF_NETLINK;
-	dest.nl_pid = pid;
-	
-	iov.iov_base = buf;
-	iov.iov_len = nlh->nlmsg_len;
-	
-	memset(&mh, 0, sizeof(mh));
-	mh.msg_name = &dest;
-	mh.msg_namelen = sizeof(dest);
-	mh.msg_iov = &iov;
-	mh.msg_iovlen = 1;
-	
-	ret = sendmsg(nl_sock, &mh, 0);
-	free(buf);
-	
-	return ret < 0 ? -errno : 0;
-}
-
-static void nl_send_hello(void)
-{
-	struct sockaddr_nl dest;
-	struct nlmsghdr *nlh;
-	nl_msg_t *msg;
-	struct msghdr mh;
-	struct iovec iov;
-	char buf[NLMSG_SPACE(sizeof(nl_msg_t))];
-	
-	memset(buf, 0, sizeof(buf));
-	nlh = (struct nlmsghdr *)buf;
-	nlh->nlmsg_len = NLMSG_SPACE(sizeof(nl_msg_t));
-	nlh->nlmsg_pid = getpid();
-	nlh->nlmsg_type = NLMSG_DONE;
-	
-	msg = (nl_msg_t *)NLMSG_DATA(nlh);
-	msg->op = 0;
-	msg->seq = 0;
-	msg->res = 0;
-	msg->len = 0;
+	if (data && datalen > 0)
+		memcpy(msg->data, data, datalen);
 	
 	memset(&dest, 0, sizeof(dest));
 	dest.nl_family = AF_NETLINK;
-	dest.nl_pid = 0; // kernel
+	dest.nl_pid = dst_pid;  // Send to specific PID
+	dest.nl_groups = 0;
 	
-	iov.iov_base = buf;
-	iov.iov_len = nlh->nlmsg_len;
+	if (sendto(nl_sock, nlh, nlh->nlmsg_len, 0,
+		   (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+		log_msg("Netlink sendto failed: %s", strerror(errno));
+		return -errno;
+	}
 	
-	memset(&mh, 0, sizeof(mh));
-	mh.msg_name = &dest;
-	mh.msg_namelen = sizeof(dest);
-	mh.msg_iov = &iov;
-	mh.msg_iovlen = 1;
-	
-	if (sendmsg(nl_sock, &mh, 0) > 0)
-		log_msg("Registered with kernel module");
+	return 0;
 }
 
 /*
@@ -359,78 +285,96 @@ static void *nl_recv_thread(void *arg)
 	struct sockaddr_nl src;
 	struct nlmsghdr *nlh;
 	nl_msg_t *msg;
-	struct msghdr mh;
-	struct iovec iov;
-	char buf[8192];
+	char buf[MAX_MSG_SIZE];
+	socklen_t addrlen;
 	pending_req_t *pend;
-	btfs_response_t brsp;
-	char rdata[BTFS_MAX_DATA];
 	uint32_t bt_seq;
 	int ret;
+	struct timespec timeout;
 	
-	log_msg("Netlink thread started");
+	log_msg("Netlink receive thread started");
 	
 	struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
 	setsockopt(nl_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	
-	nlh = (struct nlmsghdr *)buf;
-	
 	while (running) {
-		memset(&iov, 0, sizeof(iov));
-		iov.iov_base = buf;
-		iov.iov_len = sizeof(buf);
+		addrlen = sizeof(src);
+		memset(buf, 0, sizeof(buf));
 		
-		memset(&mh, 0, sizeof(mh));
-		mh.msg_name = &src;
-		mh.msg_namelen = sizeof(src);
-		mh.msg_iov = &iov;
-		mh.msg_iovlen = 1;
+		ssize_t n = recvfrom(nl_sock, buf, sizeof(buf), 0,
+				     (struct sockaddr *)&src, &addrlen);
 		
-		ssize_t n = recvmsg(nl_sock, &mh, 0);
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			if (running)
-				perror("netlink recvmsg");
+				log_msg("Netlink recvfrom error: %s", strerror(errno));
 			break;
 		}
 		
+		if (n < (ssize_t)sizeof(struct nlmsghdr))
+			continue;
+		
+		nlh = (struct nlmsghdr *)buf;
+		
+		if (n < (ssize_t)nlh->nlmsg_len)
+			continue;
+		
+		if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(nl_msg_t)))
+			continue;
+		
 		msg = (nl_msg_t *)NLMSG_DATA(nlh);
 		
-		log_msg("NL: op=%u seq=%u len=%u", msg->op, msg->seq, msg->len);
+		log_msg("NL recv: op=%u seq=%u len=%u from_pid=%u",
+			msg->op, msg->seq, msg->len, nlh->nlmsg_pid);
+		
+		/* Allocate bluetooth sequence */
+		bt_seq = __sync_fetch_and_add(&bt_seq_gen, 1);
+		
+		/* Create pending request */
+		pend = pending_add(msg->seq, nlh->nlmsg_pid, bt_seq);
+		if (!pend) {
+			nl_send_reply(nlh->nlmsg_pid, msg->seq, -ENOMEM, NULL, 0);
+			continue;
+		}
 		
 		/* Forward to Bluetooth server */
-		bt_seq = msg->seq;
-		pend = pending_add(bt_seq);
-		if (!pend) {
-			nl_send_response(nlh->nlmsg_pid, msg->seq, -ENOMEM, NULL, 0);
-			continue;
-		}
-		
 		ret = bt_send_request(msg->op, bt_seq, msg->data, msg->len);
 		if (ret < 0) {
+			log_msg("BT send failed: %d", ret);
+			nl_send_reply(pend->nl_pid, pend->nl_seq, ret, NULL, 0);
 			pending_remove(bt_seq);
-			nl_send_response(nlh->nlmsg_pid, msg->seq, ret, NULL, 0);
 			continue;
 		}
 		
-		ret = bt_wait_response(bt_seq, &brsp, rdata, sizeof(rdata));
-		if (ret < 0) {
-			pending_remove(bt_seq);
-			nl_send_response(nlh->nlmsg_pid, msg->seq, ret, NULL, 0);
-			continue;
+		/* Wait for Bluetooth response */
+		clock_gettime(CLOCK_REALTIME, &timeout);
+		timeout.tv_sec += 30;
+		
+		pthread_mutex_lock(&pend->lock);
+		while (!pend->done && running) {
+			ret = pthread_cond_timedwait(&pend->cond, &pend->lock, &timeout);
+			if (ret == ETIMEDOUT) {
+				log_msg("BT timeout for seq=%u", bt_seq);
+				pend->rsp.result = -ETIMEDOUT;
+				pend->done = 1;
+				break;
+			}
 		}
 		
-		nl_send_response(nlh->nlmsg_pid, msg->seq, brsp.result,
-				 rdata, brsp.data_len);
+		/* Send response back to kernel */
+		nl_send_reply(pend->nl_pid, pend->nl_seq,
+			      pend->rsp.result, pend->data, pend->rsp.data_len);
+		
+		pthread_mutex_unlock(&pend->lock);
+		
+		log_msg("NL reply: seq=%u res=%d len=%u to_pid=%u",
+			pend->nl_seq, pend->rsp.result, pend->rsp.data_len, pend->nl_pid);
 		
 		pending_remove(bt_seq);
-		
-		log_msg("NL: response sent seq=%u res=%d len=%u",
-			msg->seq, brsp.result, brsp.data_len);
 	}
 	
-	log_msg("Netlink thread stopped");
+	log_msg("Netlink receive thread stopped");
 	return NULL;
 }
 
@@ -443,9 +387,9 @@ static int bt_connect(const char *mac_addr)
 	bdaddr_t bdaddr;
 	int sock, channel = 1;
 	
-	/* SDP lookup */
 	str2ba(mac_addr, &bdaddr);
 	
+	/* Try SDP lookup */
 	uint32_t svc_uuid[] = {0x01110000, 0x00100000, 0x80000080, 0xFB349B5F};
 	uuid_t svc;
 	sdp_uuid128_create(&svc, &svc_uuid);
@@ -544,7 +488,6 @@ int main(int argc, char **argv)
 	log_msg("==============================================");
 	log_msg("  BTFS Client Daemon");
 	log_msg("==============================================");
-	log_msg("Server: %s", argv[1]);
 	
 	/* Connect to Bluetooth server */
 	bt_sock = bt_connect(argv[1]);
@@ -566,6 +509,7 @@ int main(int argc, char **argv)
 	memset(&local, 0, sizeof(local));
 	local.nl_family = AF_NETLINK;
 	local.nl_pid = getpid();
+	local.nl_groups = 0;
 	
 	if (bind(nl_sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
 		perror("netlink bind");
@@ -574,10 +518,37 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	
-	log_msg("Netlink socket bound");
+	log_msg("Netlink socket bound (PID=%u)", getpid());
 	
-	/* Send hello to kernel */
-	nl_send_hello();
+	/* Send hello to kernel - FIXED: dst_pid = 0 for kernel */
+	struct sockaddr_nl dest;
+	struct nlmsghdr *nlh;
+	nl_msg_t *msg;
+	char hello[NLMSG_SPACE(sizeof(nl_msg_t))];
+	
+	memset(hello, 0, sizeof(hello));
+	nlh = (struct nlmsghdr *)hello;
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(nl_msg_t));
+	nlh->nlmsg_type = NLMSG_DONE;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = 0;
+	nlh->nlmsg_pid = getpid();
+	
+	msg = (nl_msg_t *)NLMSG_DATA(nlh);
+	msg->op = 0;
+	msg->seq = 0;
+	msg->res = 0;
+	msg->len = 0;
+	
+	memset(&dest, 0, sizeof(dest));
+	dest.nl_family = AF_NETLINK;
+	dest.nl_pid = 0;  // KERNEL!
+	dest.nl_groups = 0;
+	
+	if (sendto(nl_sock, nlh, nlh->nlmsg_len, 0,
+		   (struct sockaddr *)&dest, sizeof(dest)) > 0) {
+		log_msg("Sent hello to kernel");
+	}
 	
 	log_msg("==============================================\n");
 	
@@ -600,7 +571,7 @@ int main(int argc, char **argv)
 	
 	log_msg("Daemon running. Press Ctrl+C to stop.");
 	
-	/* Wait for threads */
+	/* Wait */
 	pthread_join(bt_thread, NULL);
 	pthread_join(nl_thread, NULL);
 	
