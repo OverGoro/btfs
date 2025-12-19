@@ -353,32 +353,40 @@ static int btfs_release(struct inode *i, struct file *f)
     return ret < 0 ? ret : (res < 0 ? res : 0);
 }
 
-static void btfs_evict_inode(struct inode *inode)
-{
+static void btfs_evict_inode(struct inode *inode) {
     struct btfs_inode_info *info = BTFS_I(inode);
-
     truncate_inode_pages_final(&inode->i_data);
     clear_inode(inode);
-
-    // Если есть открытый handle - закрыть принудительно
-    if (info->fh)
-    {
-        pr_warn("btfs: Force closing file handle %llu\n", info->fh);
-        btfs_rw_req_t req;
-        uint32_t seq;
-        int32_t res;
-
-        req.file_handle = info->fh;
-        if (send_nl(BTFS_OP_CLOSE, &req, sizeof(uint64_t), &seq) == 0)
-        {
-            if (create_pend(seq))
-            {
-                wait_resp(seq, &res, NULL, 0);
+    
+    if (info->fh) {
+        // Проверяем доступность демона
+        if (daemon_pid && nl_sock) {
+            btfs_rw_req_t req;
+            uint32_t seq;
+            int32_t res;
+            req.file_handle = info->fh;
+            
+            if (send_nl(BTFS_OP_CLOSE, &req, sizeof(uint64_t), &seq) == 0) {
+                pending_t *pend = create_pend(seq);
+                if (pend) {
+                    // Короткий таймаут для evict
+                    int ret = wait_event_interruptible_timeout(pend->wait, 
+                                                               pend->done, 
+                                                               HZ);  // 1 секунда
+                    if (ret <= 0) {
+                        pr_warn("btfs: Timeout closing fh %llu during evict\n", 
+                                info->fh);
+                    }
+                    remove_pend(seq);
+                }
             }
+        } else {
+            pr_warn("btfs: Daemon unavailable, leaking fh %llu\n", info->fh);
         }
-        info->fh = 0;
+        info->fh = 0;  // Всегда очищаем
     }
 }
+
 
 static ssize_t btfs_read(struct file *f, char __user *buf, size_t len, loff_t *off)
 {
