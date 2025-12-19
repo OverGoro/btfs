@@ -399,7 +399,6 @@ static struct inode *btfs_new_inode(struct super_block *sb, struct btfs_attr *fa
 static int btfs_open(struct inode *inode, struct file *file)
 {
 	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_ino *bi = BTFS_INO(inode);
 	struct btfs_file *bf;
 	struct btfs_open_req req;
 	struct btfs_open_resp rsp;
@@ -409,37 +408,33 @@ static int btfs_open(struct inode *inode, struct file *file)
 	if (!bf)
 		return -ENOMEM;
 	
-	mutex_lock(&bi->lock);
-	if (bi->fh) {
-		bf->fh = bi->fh;
-		file->private_data = bf;
-		mutex_unlock(&bi->lock);
-		return 0;
-	}
-	
 	memset(&req, 0, sizeof(req));
 	ret = btfs_path(file->f_path.dentry, req.path, BTFS_MAX_PATH);
 	if (ret) {
-		mutex_unlock(&bi->lock);
 		kfree(bf);
 		return ret;
 	}
 	
-	req.flags = file->f_flags & (O_RDONLY|O_WRONLY|O_RDWR);
+	/* Правильная обработка флагов */
+	req.flags = file->f_flags & (O_RDONLY|O_WRONLY|O_RDWR|O_APPEND|O_TRUNC|O_CREAT);
 	req.mode = 0;
 	req.lock_type = 0;
 	
+	pr_info("btfs_open: path='%s' flags=0x%x f_flags=0x%x\n",
+		req.path, req.flags, file->f_flags);
+	
 	ret = btfs_rpc(mnt, BTFS_OP_OPEN, &req, sizeof(req), &rsp, sizeof(rsp));
 	if (ret < 0) {
-		mutex_unlock(&bi->lock);
+		pr_err("btfs_open: RPC failed %d\n", ret);
 		kfree(bf);
 		return ret;
 	}
 	
-	bi->fh = rsp.file_handle;
 	bf->fh = rsp.file_handle;
 	file->private_data = bf;
-	mutex_unlock(&bi->lock);
+	
+	pr_info("btfs_open: success handle=%llu\n", bf->fh);
+	
 	return 0;
 }
 
@@ -452,14 +447,19 @@ static int btfs_release(struct inode *inode, struct file *file)
 	if (!bf)
 		return 0;
 	
+	pr_info("btfs_release: closing handle=%llu\n", bf->fh);
+	
 	req.file_handle = bf->fh;
-	kfree(bf);
 	
 	if (mnt->ready)
 		btfs_rpc(mnt, BTFS_OP_CLOSE, &req, sizeof(req), NULL, 0);
 	
+	kfree(bf);
+	file->private_data = NULL;
+	
 	return 0;
 }
+
 
 static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {

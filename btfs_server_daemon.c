@@ -270,7 +270,10 @@ void *lock_timeout_thread(void *arg) {
 uint64_t handle_open(uint32_t client_id, const char *rel_path,
                      uint32_t flags, uint32_t mode, uint32_t lock_type) {
     char full_path[PATH_MAX];
-    if (build_full_path(full_path, sizeof(full_path), rel_path) < 0) return 0;
+    if (build_full_path(full_path, sizeof(full_path), rel_path) < 0) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
     
     // Проверить блокировки
     if (lock_type != BTFS_LOCK_NONE) {
@@ -281,12 +284,46 @@ uint64_t handle_open(uint32_t client_id, const char *rel_path,
         }
     }
     
-    int fd = open(full_path, flags, mode);
-    if (fd < 0) return 0;
+    // ИСПРАВЛЕНО: Правильная конвертация флагов из BTFS в POSIX
+    int posix_flags = 0;
+    
+    // Режим доступа (взаимоисключающие)
+    if ((flags & O_ACCMODE) == O_WRONLY) {
+        posix_flags = O_WRONLY;
+    } else if ((flags & O_ACCMODE) == O_RDWR) {
+        posix_flags = O_RDWR;
+    } else {
+        posix_flags = O_RDONLY;
+    }
+    
+    // Дополнительные флаги
+    if (flags & O_APPEND) posix_flags |= O_APPEND;
+    if (flags & O_TRUNC)  posix_flags |= O_TRUNC;
+    if (flags & O_CREAT)  posix_flags |= O_CREAT;
+    if (flags & O_EXCL)   posix_flags |= O_EXCL;
+    if (flags & O_SYNC)   posix_flags |= O_SYNC;
+    
+    print_log("[Client %u] Opening: %s flags=0x%x->0x%x mode=0%o",
+              client_id, rel_path, flags, posix_flags, mode);
+    
+    int fd = open(full_path, posix_flags, mode ? mode : 0644);
+    if (fd < 0) {
+        int err = errno;
+        print_log("[Client %u] Open failed: %s -> %s (errno=%d)",
+                  client_id, rel_path, strerror(err), err);
+        errno = err;
+        return 0;
+    }
     
     uint32_t lock_id = 0;
     if (lock_type != BTFS_LOCK_NONE) {
         lock_id = acquire_lock(rel_path, lock_type, client_id, 0);
+        if (!lock_id) {
+            print_log("[Client %u] Failed to acquire lock for: %s", client_id, rel_path);
+            close(fd);
+            errno = ENOMEM;
+            return 0;
+        }
     }
     
     pthread_mutex_lock(&files_mutex);
@@ -303,6 +340,7 @@ uint64_t handle_open(uint32_t client_id, const char *rel_path,
         pthread_mutex_unlock(&files_mutex);
         close(fd);
         if (lock_id) release_lock(lock_id, client_id);
+        print_log("[Client %u] No free slots in open_files table", client_id);
         errno = ENFILE;
         return 0;
     }
@@ -310,19 +348,21 @@ uint64_t handle_open(uint32_t client_id, const char *rel_path,
     open_files[slot].handle = next_file_handle++;
     open_files[slot].fd = fd;
     strncpy(open_files[slot].path, rel_path, BTFS_MAX_PATH - 1);
+    open_files[slot].path[BTFS_MAX_PATH - 1] = '\0';
     open_files[slot].client_id = client_id;
-    open_files[slot].flags = flags;
+    open_files[slot].flags = posix_flags;  // ИСПРАВЛЕНО: сохраняем POSIX флаги
     open_files[slot].lock_id = lock_id;
     open_files[slot].last_access = time(NULL);
     
     uint64_t handle = open_files[slot].handle;
     pthread_mutex_unlock(&files_mutex);
     
-    print_log("[Client %u] File opened: %s (handle=%lu, fd=%d, lock=%u)",
-              client_id, rel_path, handle, fd, lock_id);
+    print_log("[Client %u] File opened: %s (handle=%lu, fd=%d, posix_flags=0x%x, lock=%u)",
+              client_id, rel_path, handle, fd, posix_flags, lock_id);
     
     return handle;
 }
+
 
 int handle_close(uint32_t client_id, uint64_t file_handle) {
     pthread_mutex_lock(&files_mutex);
