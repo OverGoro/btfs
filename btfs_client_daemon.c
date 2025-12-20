@@ -168,67 +168,74 @@ static int bt_send_request(uint32_t opcode, uint32_t seq,
  */
 static void *bt_recv_thread(void *arg)
 {
-	btfs_response_t rsp;
-	pending_req_t *req;
-	
-	log_msg("BT receive thread started");
-	
-	struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-	setsockopt(bt_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	
-	while (running) {
-		ssize_t n = read(bt_sock, &rsp, sizeof(rsp));
-		
-		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				continue;
-			if (running)
-				log_msg("BT read error: %s", strerror(errno));
-			break;
-		}
-		
-		if (n == 0) {
-			log_msg("BT connection closed");
-			break;
-		}
-		
-		if (n != sizeof(rsp)) {
-			log_msg("BT partial read");
-			continue;
-		}
-		
-		/* Skip PING responses */
-		if (rsp.opcode == BTFS_OP_PING)
-			continue;
-		
-		req = pending_find_by_bt(rsp.sequence);
-		if (!req) {
-			log_msg("Unknown BT sequence: %u", rsp.sequence);
-			continue;
-		}
-		
-		pthread_mutex_lock(&req->lock);
-		memcpy(&req->rsp, &rsp, sizeof(rsp));
-		
-		if (rsp.data_len > 0) {
-			size_t toread = rsp.data_len < BTFS_MAX_DATA ?
-					rsp.data_len : BTFS_MAX_DATA;
-			
-			n = read(bt_sock, req->data, toread);
-			if (n != (ssize_t)toread) {
-				log_msg("BT data read error");
-				req->rsp.result = -EIO;
-			}
-		}
-		
-		req->done = 1;
-		pthread_cond_signal(&req->cond);
-		pthread_mutex_unlock(&req->lock);
-	}
-	
-	log_msg("BT receive thread stopped");
-	return NULL;
+    btfs_response_t rsp;
+    pending_req_t *req;
+    
+    log_msg("BT receive thread started");
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};  // Увеличить timeout до 5 секунд
+    setsockopt(bt_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    while (running) {
+        ssize_t n = read(bt_sock, &rsp, sizeof(rsp));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            if (running)
+                log_msg("BT read error: %s", strerror(errno));
+            break;
+        }
+        
+        if (n == 0) {
+            log_msg("BT connection closed");
+            break;
+        }
+        
+        if (n != sizeof(rsp)) {
+            log_msg("BT partial read");
+            continue;
+        }
+        
+        /* Skip PING responses */
+        if (rsp.opcode == BTFS_OP_PING)
+            continue;
+        
+        req = pending_find_by_bt(rsp.sequence);
+        if (!req) {
+            log_msg("Unknown BT sequence: %u", rsp.sequence);
+            continue;
+        }
+        
+        pthread_mutex_lock(&req->lock);
+        memcpy(&req->rsp, &rsp, sizeof(rsp));
+        
+        // ИСПРАВЛЕНО: использовать recv() с MSG_WAITALL
+        if (rsp.data_len > 0) {
+            size_t toread = rsp.data_len < BTFS_MAX_DATA ?
+                            rsp.data_len : BTFS_MAX_DATA;
+            
+            log_msg("BT reading %zu bytes of data", toread);
+            
+            // MSG_WAITALL - ждать пока не получим ВСЕ данные
+            n = recv(bt_sock, req->data, toread, MSG_WAITALL);
+            
+            if (n != (ssize_t)toread) {
+                log_msg("BT data recv failed: got %zd, expected %zu, errno=%s",
+                        n, toread, strerror(errno));
+                req->rsp.result = -EIO;
+            } else {
+                log_msg("BT data recv success: %zu bytes", toread);
+            }
+        }
+        
+        req->done = 1;
+        pthread_cond_signal(&req->cond);
+        pthread_mutex_unlock(&req->lock);
+    }
+    
+    log_msg("BT receive thread stopped");
+    return NULL;
 }
+
 
 /*
  * PING keepalive thread
