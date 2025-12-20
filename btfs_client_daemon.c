@@ -134,33 +134,52 @@ static void pending_remove(uint32_t bt_seq)
 /*
  * Bluetooth communication
  */
-static int bt_send_request(uint32_t opcode, uint32_t seq, 
-			   const void *data, uint32_t len)
+static int bt_send_request(uint32_t opcode, uint32_t seq,
+                            const void *data, uint32_t len)
 {
-	btfs_header_t hdr;
-	
-	pthread_mutex_lock(&bt_lock);
-	
-	hdr.opcode = opcode;
-	hdr.sequence = seq;
-	hdr.client_id = getpid();
-	hdr.flags = 0;
-	hdr.data_len = len;
-	
-	if (write(bt_sock, &hdr, sizeof(hdr)) != sizeof(hdr)) {
-		pthread_mutex_unlock(&bt_lock);
-		return -EIO;
-	}
-	
-	if (data && len > 0) {
-		if (write(bt_sock, data, len) != (ssize_t)len) {
-			pthread_mutex_unlock(&bt_lock);
-			return -EIO;
-		}
-	}
-	
-	pthread_mutex_unlock(&bt_lock);
-	return 0;
+    btfs_header_t hdr;
+    
+    pthread_mutex_lock(&bt_lock);
+    
+    hdr.opcode = opcode;
+    hdr.sequence = seq;
+    hdr.client_id = getpid();
+    hdr.flags = 0;
+    hdr.data_len = len;
+    
+    // ИСПРАВЛЕНО: отправить заголовок полностью
+    size_t sent = 0;
+    while (sent < sizeof(hdr)) {
+        ssize_t n = write(bt_sock, (char*)&hdr + sent, sizeof(hdr) - sent);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            pthread_mutex_unlock(&bt_lock);
+            log_msg("BT header send failed: %s", strerror(errno));
+            return -EIO;
+        }
+        sent += n;
+    }
+    
+    // ИСПРАВЛЕНО: отправить данные полностью
+    if (data && len > 0) {
+        sent = 0;
+        while (sent < len) {
+            ssize_t n = write(bt_sock, (char*)data + sent, len - sent);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                pthread_mutex_unlock(&bt_lock);
+                log_msg("BT data send failed: %s", strerror(errno));
+                return -EIO;
+            }
+            sent += n;
+        }
+        log_msg("BT data sent successfully: %u bytes", len);
+    }
+    
+    pthread_mutex_unlock(&bt_lock);
+    return 0;
 }
 
 /*

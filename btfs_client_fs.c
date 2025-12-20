@@ -578,60 +578,78 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_file *bf;
-	struct btfs_write_req *wreq;
-	struct btfs_write_resp wrsp;
-	size_t count = iov_iter_count(from);
-	loff_t pos = iocb->ki_pos;
-	size_t max_chunk = BTFS_CHUNK_SIZE;
-	int ret;
-	
-	ret = btfs_ensure_open(inode, file);
-	if (ret < 0)
-		return ret;
-	
-	bf = file->private_data;
-	if (!bf || bf->fh == 0)
-		return -EBADF;
-	
-	if (count > max_chunk)
-		count = max_chunk;
-	
-	wreq = kmalloc(sizeof(*wreq) + count, GFP_KERNEL);
-	if (!wreq)
-		return -ENOMEM;
-	
-	wreq->file_handle = bf->fh;
-	wreq->offset = pos;
-	wreq->size = count;
-	
-	if (!copy_from_iter_full(wreq->data, count, from)) {
-		kfree(wreq);
-		return -EFAULT;
-	}
-	
-	pr_info("btfs_write_iter: handle=%llu offset=%lld size=%zu\n",
-		bf->fh, pos, count);
-	
-	ret = btfs_rpc(mnt, BTFS_OP_WRITE, wreq, sizeof(*wreq) + count, &wrsp, sizeof(wrsp));
-	kfree(wreq);
-	
-	if (ret < 0) {
-		pr_err("btfs_write_iter: RPC failed %d\n", ret);
-		return ret;
-	}
-	
-	iocb->ki_pos = pos + wrsp.bytes_written;
-	if (iocb->ki_pos > i_size_read(inode))
-		i_size_write(inode, iocb->ki_pos);
-	
-	pr_info("btfs_write_iter: written %u bytes\n", wrsp.bytes_written);
-	
-	return wrsp.bytes_written;
+    struct file *file = iocb->ki_filp;
+    struct inode *inode = file_inode(file);
+    struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+    struct btfs_file *bf;
+    struct btfs_write_req *wreq;
+    struct btfs_write_resp wrsp;
+    size_t count = iov_iter_count(from);
+    loff_t pos = iocb->ki_pos;
+    size_t max_chunk = BTFS_CHUNK_SIZE;  // ИСПРАВЛЕНО: как в read
+    ssize_t total = 0;
+    int ret;
+
+    ret = btfs_ensure_open(inode, file);
+    if (ret < 0)
+        return ret;
+
+    bf = file->private_data;
+    if (!bf || bf->fh == 0)
+        return -EBADF;
+
+    // ДОБАВЛЕНО: цикл для записи больших файлов
+    while (count > 0) {
+        size_t chunk = min_t(size_t, count, max_chunk);
+        
+        wreq = kmalloc(sizeof(*wreq) + chunk, GFP_KERNEL);
+        if (!wreq)
+            return total ? total : -ENOMEM;
+
+        wreq->file_handle = bf->fh;
+        wreq->offset = pos;
+        wreq->size = chunk;
+
+        if (!copy_from_iter_full(wreq->data, chunk, from)) {
+            kfree(wreq);
+            return total ? total : -EFAULT;
+        }
+
+        pr_info("btfs_write_iter: handle=%llu offset=%lld size=%zu\n",
+                bf->fh, pos, chunk);
+
+        ret = btfs_rpc(mnt, BTFS_OP_WRITE, wreq, sizeof(*wreq) + chunk, 
+                       &wrsp, sizeof(wrsp));
+        kfree(wreq);
+
+        if (ret < 0) {
+            pr_err("btfs_write_iter: RPC failed %d\n", ret);
+            return total ? total : ret;
+        }
+
+        pr_info("btfs_write_iter: written %u bytes\n", wrsp.bytes_written);
+
+        // Если записано меньше chunk - ошибка или диск полон
+        if (wrsp.bytes_written < chunk) {
+            pr_warn("btfs_write_iter: short write (%u < %zu)\n", 
+                    wrsp.bytes_written, chunk);
+            total += wrsp.bytes_written;
+            pos += wrsp.bytes_written;
+            break;
+        }
+
+        total += wrsp.bytes_written;
+        pos += wrsp.bytes_written;
+        count -= wrsp.bytes_written;
+    }
+
+    iocb->ki_pos = pos;
+    if (iocb->ki_pos > i_size_read(inode))
+        i_size_write(inode, iocb->ki_pos);
+
+    return total;
 }
+
 
 static int btfs_readdir(struct file *file, struct dir_context *ctx)
 {
