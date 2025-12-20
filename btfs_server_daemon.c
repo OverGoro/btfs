@@ -21,14 +21,13 @@
 #include <limits.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
-#include <bluetooth/sdp.h>
-#include <bluetooth/sdp_lib.h>
 #include "btfs_protocol.h"
 
 #define MAX_CLIENTS		10
 #define MAX_OPEN_FILES		1000
 #define LOCK_CHECK_INTERVAL	5
 #define CLIENT_TIMEOUT		60
+#define RFCOMM_CHANNEL		1
 
 typedef struct file_lock {
 	uint32_t lock_id;
@@ -931,72 +930,6 @@ static void *client_thread(void *arg)
 	return NULL;
 }
 
-/* ========== SDP registration ========== */
-
-static sdp_session_t *register_sdp_service(uint8_t channel)
-{
-	uint32_t service_uuid_int[] = { 0x01110000, 0x00100000, 0x80000080, 0xFB349B5F };
-	uuid_t root_uuid, l2cap_uuid, rfcomm_uuid, svc_uuid, svc_class_uuid;
-	sdp_list_t *l2cap_list = NULL, *rfcomm_list = NULL, *root_list = NULL,
-		   *proto_list = NULL, *access_proto_list = NULL,
-		   *svc_class_list = NULL, *profile_list = NULL;
-	sdp_data_t *channel_data;
-	sdp_profile_desc_t profile;
-	sdp_record_t *record = sdp_record_alloc();
-	sdp_session_t *session;
-
-	sdp_uuid128_create(&svc_uuid, &service_uuid_int);
-	sdp_set_service_id(record, svc_uuid);
-
-	sdp_uuid32_create(&svc_class_uuid, SERIAL_PORT_SVCLASS_ID);
-	svc_class_list = sdp_list_append(NULL, &svc_class_uuid);
-	sdp_set_service_classes(record, svc_class_list);
-
-	sdp_uuid16_create(&profile.uuid, SERIAL_PORT_PROFILE_ID);
-	profile.version = 0x0100;
-	profile_list = sdp_list_append(NULL, &profile);
-	sdp_set_profile_descs(record, profile_list);
-
-	sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
-	root_list = sdp_list_append(NULL, &root_uuid);
-	sdp_set_browse_groups(record, root_list);
-
-	sdp_uuid16_create(&l2cap_uuid, L2CAP_UUID);
-	l2cap_list = sdp_list_append(NULL, &l2cap_uuid);
-	proto_list = sdp_list_append(NULL, l2cap_list);
-
-	sdp_uuid16_create(&rfcomm_uuid, RFCOMM_UUID);
-	channel_data = sdp_data_alloc(SDP_UINT8, &channel);
-	rfcomm_list = sdp_list_append(NULL, &rfcomm_uuid);
-	sdp_list_append(rfcomm_list, channel_data);
-	sdp_list_append(proto_list, rfcomm_list);
-
-	access_proto_list = sdp_list_append(NULL, proto_list);
-	sdp_set_access_protos(record, access_proto_list);
-
-	sdp_set_info_attr(record, "BTFS File System Server", "BTFS",
-			  "Bluetooth Distributed File System");
-
-	session = sdp_connect(BDADDR_ANY, BDADDR_LOCAL, SDP_RETRY_IF_BUSY);
-	if (!session)
-		return NULL;
-
-	if (sdp_record_register(session, record, 0) < 0) {
-		sdp_close(session);
-		return NULL;
-	}
-
-	sdp_data_free(channel_data);
-	sdp_list_free(l2cap_list, 0);
-	sdp_list_free(rfcomm_list, 0);
-	sdp_list_free(root_list, 0);
-	sdp_list_free(access_proto_list, 0);
-	sdp_list_free(svc_class_list, 0);
-	sdp_list_free(profile_list, 0);
-
-	return session;
-}
-
 /* ========== Signal handling ========== */
 
 static void signal_handler(int sig)
@@ -1012,13 +945,12 @@ int main(int argc, char **argv)
 	struct sockaddr_rc loc_addr = {
 		.rc_family = AF_BLUETOOTH,
 		.rc_bdaddr = *BDADDR_ANY,
-		.rc_channel = 1,
+		.rc_channel = RFCOMM_CHANNEL,
 	};
 	struct sockaddr_rc rem_addr;
 	socklen_t opt;
 	struct timeval tv = { .tv_sec = 1 };
 	int server_sock, client_sock, slot;
-	sdp_session_t *sdp;
 	pthread_t lock_thread;
 
 	if (argc != 2) {
@@ -1041,6 +973,7 @@ int main(int argc, char **argv)
 	log_msg("===================================================");
 	log_msg("Shared directory: %s", base_path);
 	log_msg("Max clients: %d", MAX_CLIENTS);
+	log_msg("RFCOMM channel: %d", RFCOMM_CHANNEL);
 
 	memset(clients, 0, sizeof(clients));
 	memset(open_files, 0, sizeof(open_files));
@@ -1055,16 +988,12 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	sdp = register_sdp_service(1);
-	if (!sdp)
-		log_msg("WARNING: SDP registration failed");
-
 	if (listen(server_sock, MAX_CLIENTS) < 0) {
 		perror("Listen failed");
 		goto cleanup;
 	}
 
-	log_msg("Server listening on RFCOMM channel 1");
+	log_msg("Server listening on RFCOMM channel %d", RFCOMM_CHANNEL);
 	log_msg("===================================================\n");
 
 	while (server_running) {
@@ -1119,8 +1048,6 @@ cleanup:
 
 	if (server_sock >= 0)
 		close(server_sock);
-	if (sdp)
-		sdp_close(sdp);
 
 	for (int i = 0; i < MAX_CLIENTS; i++) {
 		if (clients[i].active) {
