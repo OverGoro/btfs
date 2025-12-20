@@ -1,9 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * BTFS - Bluetooth Network Filesystem Client
- * Copyright (C) 2024 BTFS Team
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>

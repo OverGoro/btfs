@@ -1,9 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * BTFS Client Daemon - Netlink <-> Bluetooth bridge
- * Copyright (C) 2024 BTFS Team
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,18 +7,16 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <linux/netlink.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/rfcomm.h>
-#include <bluetooth/sdp.h>
-#include <bluetooth/sdp_lib.h>
 #include "btfs_protocol.h"
 
 #define NETLINK_BTFS		31
 #define MAX_MSG_SIZE		8192
 #define PING_INTERVAL		5
 #define RESPONSE_TIMEOUT	30
+#define RFCOMM_CHANNEL		1
 
 typedef struct {
 	uint32_t op;
@@ -218,7 +210,6 @@ static void *bt_recv_thread(void *arg)
 		if (rsp.data_len > 0) {
 			size_t toread = rsp.data_len < BTFS_MAX_DATA ?
 					rsp.data_len : BTFS_MAX_DATA;
-
 			n = recv(bt_sock, req->data, toread, MSG_WAITALL);
 			if (n != (ssize_t)toread)
 				req->rsp.result = -EIO;
@@ -378,69 +369,23 @@ static void *nl_recv_thread(void *arg)
 
 static int bt_connect(const char *mac_addr)
 {
-	struct sockaddr_rc addr = { .rc_family = AF_BLUETOOTH, .rc_channel = 1 };
+	struct sockaddr_rc addr = {
+		.rc_family = AF_BLUETOOTH,
+		.rc_channel = RFCOMM_CHANNEL,
+	};
 	bdaddr_t bdaddr;
-	int sock, channel = 1;
+	int sock;
 
 	str2ba(mac_addr, &bdaddr);
+	bacpy(&addr.rc_bdaddr, &bdaddr);
 
-	/* Try SDP service discovery */
-	uint32_t svc_uuid[] = { 0x01110000, 0x00100000, 0x80000080, 0xFB349B5F };
-	uuid_t svc;
-	sdp_uuid128_create(&svc, &svc_uuid);
-
-	sdp_session_t *session = sdp_connect(BDADDR_ANY, &bdaddr,
-					     SDP_RETRY_IF_BUSY);
-	if (session) {
-		sdp_list_t *search = sdp_list_append(NULL, &svc);
-		sdp_list_t *response = NULL;
-		uint32_t range = 0x0000ffff;
-		sdp_list_t *attrid = sdp_list_append(NULL, &range);
-
-		if (sdp_service_search_attr_req(session, search,
-						SDP_ATTR_REQ_RANGE,
-						attrid, &response) == 0) {
-			for (sdp_list_t *r = response; r; r = r->next) {
-				sdp_record_t *rec = r->data;
-				sdp_list_t *proto;
-
-				if (sdp_get_access_protos(rec, &proto) == 0) {
-					for (sdp_list_t *p = proto; p; p = p->next) {
-						sdp_list_t *pds = p->data;
-						for (; pds; pds = pds->next) {
-							sdp_data_t *d = pds->data;
-							int pr = 0;
-							for (; d; d = d->next) {
-								if (d->dtd == SDP_UUID16 ||
-								    d->dtd == SDP_UUID32 ||
-								    d->dtd == SDP_UUID128)
-									pr = sdp_uuid_to_proto(&d->val.uuid);
-								else if (d->dtd == SDP_UINT8 &&
-									 pr == RFCOMM_UUID)
-									channel = d->val.uint8;
-							}
-						}
-					}
-					sdp_list_free(proto, 0);
-				}
-			}
-			sdp_list_free(response, 0);
-		}
-		sdp_list_free(search, 0);
-		sdp_list_free(attrid, 0);
-		sdp_close(session);
-	}
-
-	log_msg("Connecting to %s channel %d", mac_addr, channel);
+	log_msg("Connecting to %s channel %d", mac_addr, RFCOMM_CHANNEL);
 
 	sock = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
 	if (sock < 0) {
 		perror("socket");
 		return -1;
 	}
-
-	addr.rc_channel = channel;
-	bacpy(&addr.rc_bdaddr, &bdaddr);
 
 	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		perror("connect");
@@ -508,13 +453,11 @@ int main(int argc, char **argv)
 
 	log_msg("Netlink socket bound (PID=%u)", getpid());
 
-	/* Send hello to kernel */
 	memset(hello, 0, sizeof(hello));
 	nlh = (struct nlmsghdr *)hello;
 	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(nl_msg_t));
 	nlh->nlmsg_type = NLMSG_DONE;
 	nlh->nlmsg_pid = getpid();
-
 	msg = (nl_msg_t *)NLMSG_DATA(nlh);
 	msg->seq = 0;
 
@@ -522,6 +465,7 @@ int main(int argc, char **argv)
 		   (struct sockaddr *)&dest, sizeof(dest)) > 0)
 		log_msg("Sent hello to kernel");
 
+	log_msg("RFCOMM channel: %d", RFCOMM_CHANNEL);
 	log_msg("PING interval: %d seconds", PING_INTERVAL);
 	log_msg("==============================================\n");
 
