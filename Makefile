@@ -3,7 +3,7 @@ obj-m += btfs_client_fs.o
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-all: daemons btfs_test_client btfs_netlink_test modules
+all: daemons modules
 
 modules:
 	make -C $(KERNEL_DIR) M=$(PWD) modules
