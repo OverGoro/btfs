@@ -25,6 +25,8 @@ MODULE_DESCRIPTION("Bluetooth Filesystem Client");
 #define BTFS_MAX_DATA 4096
 #define BTFS_TIMEOUT (30*HZ)
 
+#define BTFS_CHUNK_SIZE 2048  // Размер одного RPC запроса
+
 /* Protocol - MUST MATCH btfs_protocol.h */
 enum {
 	BTFS_OP_GETATTR = 1,
@@ -529,12 +531,12 @@ static ssize_t btfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
     if (!bf || bf->fh == 0)
         return -EBADF;
 
-    rbuf = kmalloc(sizeof(*rsp) + PAGE_SIZE, GFP_KERNEL);
+    rbuf = kmalloc(sizeof(*rsp) + BTFS_CHUNK_SIZE, GFP_KERNEL);
     if (!rbuf)
         return -ENOMEM;
 
     while (count > 0) {
-        size_t chunk = min_t(size_t, count, PAGE_SIZE);
+        size_t chunk = min_t(size_t, count, BTFS_CHUNK_SIZE);
         
         req.file_handle = bf->fh;
         req.offset = pos;
@@ -584,7 +586,7 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct btfs_write_resp wrsp;
 	size_t count = iov_iter_count(from);
 	loff_t pos = iocb->ki_pos;
-	size_t max_chunk = PAGE_SIZE;
+	size_t max_chunk = BTFS_CHUNK_SIZE;
 	int ret;
 	
 	ret = btfs_ensure_open(inode, file);
