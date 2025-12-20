@@ -300,39 +300,56 @@ static int btfs_rpc(struct btfs_mnt *mnt, u32 op,
  */
 static void btfs_nl_input(struct sk_buff *skb)
 {
-	struct nlmsghdr *nlh = nlmsg_hdr(skb);
-	struct btfs_nl_msg *msg = nlmsg_data(nlh);
-	struct btfs_mnt *mnt;
-	struct btfs_call *call;
-	
-	spin_lock(&btfs_mnt_lock);
-	mnt = btfs_mnt_active;
-	spin_unlock(&btfs_mnt_lock);
-	
-	if (!mnt)
-		return;
-	
-	if (!mnt->ready) {
-		mnt->daemon = nlh->nlmsg_pid;
-		mnt->ready = 1;
-		pr_info("btfs: daemon registered pid=%u\n", mnt->daemon);
-		return;
-	}
-	
-	call = btfs_call_find(mnt, msg->seq);
-	if (!call)
-		return;
-	
-	call->err = msg->res;
-	if (msg->len > 0 && msg->res >= 0) {
-		call->buf = kmemdup(msg->data, msg->len, GFP_ATOMIC);
-		if (call->buf)
-			call->buflen = msg->len;
-	}
-	
-	call->done = 1;
-	wake_up(&call->wq);
+    struct nlmsghdr *nlh = nlmsg_hdr(skb);
+    struct btfs_nl_msg *msg = nlmsg_data(nlh);
+    struct btfs_mnt *mnt;
+    struct btfs_call *call;
+
+    pr_info("btfs_nl_input: received nlmsg_len=%u\n", nlh->nlmsg_len);
+
+    spin_lock(&btfs_mnt_lock);
+    mnt = btfs_mnt_active;
+    spin_unlock(&btfs_mnt_lock);
+
+    if (!mnt) {
+        pr_warn("btfs_nl_input: no active mount\n");
+        return;
+    }
+
+    if (!mnt->ready) {
+        mnt->daemon = nlh->nlmsg_pid;
+        mnt->ready = 1;
+        pr_info("btfs: daemon registered pid=%u\n", mnt->daemon);
+        return;
+    }
+
+    call = btfs_call_find(mnt, msg->seq);
+    if (!call) {
+        pr_warn("btfs_nl_input: no call found for seq=%u\n", msg->seq);
+        return;
+    }
+
+    pr_info("btfs_nl_input: seq=%u res=%d len=%u\n", msg->seq, msg->res, msg->len);
+
+    call->err = msg->res;
+    
+    if (msg->len > 0 && msg->res >= 0) {
+        pr_info("btfs_nl_input: trying to kmemdup %u bytes\n", msg->len);
+        
+        call->buf = kmemdup(msg->data, msg->len, GFP_ATOMIC);
+        if (call->buf) {
+            call->buflen = msg->len;
+            pr_info("btfs_nl_input: allocated buffer %zu bytes\n", call->buflen);
+        } else {
+            pr_err("btfs_nl_input: kmemdup FAILED for %u bytes!\n", msg->len);
+            call->err = -ENOMEM;
+        }
+    }
+
+    call->done = 1;
+    wake_up(&call->wq);
 }
+
 
 /*
  * Path conversion
