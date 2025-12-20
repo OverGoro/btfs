@@ -550,26 +550,76 @@ int handle_chown(const char *rel_path, uint32_t uid, uint32_t gid) {
 // ============ ПРОТОКОЛ ============
 
 int send_response(int sock, uint32_t sequence, uint32_t opcode,
-                  int32_t result, const void *data, uint32_t data_len) {
-    btfs_response_t resp = { .opcode = opcode, .sequence = sequence, 
-                             .result = result, .data_len = data_len };
+                  int32_t result, const void *data, uint32_t data_len)
+{
+    btfs_response_t resp = {
+        .opcode = opcode,
+        .sequence = sequence,
+        .result = result,
+        .data_len = data_len
+    };
     
-    if (write(sock, &resp, sizeof(resp)) != sizeof(resp)) return -1;
-    if (data && data_len > 0 && write(sock, data, data_len) != data_len) return -1;
+    // Отправляем заголовок полностью
+    size_t sent = 0;
+    while (sent < sizeof(resp)) {
+        ssize_t n = write(sock, (char*)&resp + sent, sizeof(resp) - sent);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            print_log("Response header send failed: %s", strerror(errno));
+            return -1;
+        }
+        sent += n;
+    }
     
-    return 0;
-}
-
-int receive_request(int sock, btfs_header_t *header, char *data_buffer, size_t buffer_size) {
-    if (read(sock, header, sizeof(btfs_header_t)) != sizeof(btfs_header_t)) return -1;
-    
-    if (header->data_len > 0) {
-        if (header->data_len > buffer_size) return -E2BIG;
-        if (read(sock, data_buffer, header->data_len) != header->data_len) return -1;
+    // Отправляем данные полностью
+    if (data && data_len > 0) {
+        sent = 0;
+        while (sent < data_len) {
+            ssize_t n = write(sock, (char*)data + sent, data_len - sent);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                print_log("Response data send failed: %s", strerror(errno));
+                return -1;
+            }
+            sent += n;
+        }
     }
     
     return 0;
 }
+
+
+int receive_request(int sock, btfs_header_t *header, char *data_buffer, size_t buffer_size)
+{
+    // Читаем заголовок с MSG_WAITALL
+    ssize_t n = recv(sock, header, sizeof(btfs_header_t), MSG_WAITALL);
+    if (n != sizeof(btfs_header_t)) {
+        if (n > 0)
+            print_log("Partial header read: got %zd, expected %zu", n, sizeof(btfs_header_t));
+        return -1;
+    }
+    
+    // Читаем данные если есть
+    if (header->data_len > 0) {
+        if (header->data_len > buffer_size) {
+            print_log("Request data too large: %u > %zu", header->data_len, buffer_size);
+            return -E2BIG;
+        }
+        
+        // MSG_WAITALL - ждём пока не получим ВСЕ данные
+        n = recv(sock, data_buffer, header->data_len, MSG_WAITALL);
+        if (n != (ssize_t)header->data_len) {
+            print_log("Data recv failed: got %zd, expected %u, errno=%s",
+                      n, header->data_len, strerror(errno));
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
 
 // ============ ОБРАБОТЧИК ЗАПРОСОВ ============
 
