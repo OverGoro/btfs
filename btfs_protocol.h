@@ -124,6 +124,12 @@ typedef struct {
     uint32_t timeout_sec;
 } __attribute__((packed)) btfs_lock_req_t;
 
+
+typedef struct {
+    uint64_t file_handle;
+} __attribute__((packed)) btfs_fsync_req_t;
+
+
 // Response structures
 typedef struct {
     uint64_t ino;

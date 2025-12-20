@@ -485,6 +485,34 @@ static int btfs_open(struct inode *inode, struct file *file)
 	return btfs_ensure_open(inode, file);
 }
 
+static int btfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+    struct inode *inode = file_inode(file);
+    struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+    struct btfs_file *bf = file->private_data;
+    struct btfs_fsync_req {
+        u64 file_handle;
+    } __packed req;
+    int ret;
+    
+    if (!bf || bf->fh == 0)
+        return -EBADF;
+    
+    req.file_handle = bf->fh;
+    
+    pr_info("btfs_fsync: handle=%llu\n", bf->fh);
+    
+    ret = btfs_rpc(mnt, BTFS_OP_FSYNC, &req, sizeof(req), NULL, 0);
+    if (ret < 0) {
+        pr_err("btfs_fsync: RPC failed %d\n", ret);
+        return ret;
+    }
+    
+    pr_info("btfs_fsync: success\n");
+    return 0;
+}
+
+
 
 static int btfs_release(struct inode *inode, struct file *file)
 {
@@ -651,6 +679,7 @@ static ssize_t btfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 }
 
 
+
 static int btfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
@@ -731,6 +760,7 @@ static const struct file_operations btfs_file_fops = {
 	.release = btfs_release,
 	.read_iter = btfs_read_iter,
 	.write_iter = btfs_write_iter,
+	.fsync = btfs_fsync,
 	.llseek = generic_file_llseek,
 };
 
