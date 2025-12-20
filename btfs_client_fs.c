@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/statfs.h>
 #include <linux/slab.h>
 #include <linux/pagemap.h>
 #include <linux/netlink.h>
@@ -29,19 +30,30 @@ MODULE_DESCRIPTION("Bluetooth Filesystem Client");
 
 /* Protocol - MUST MATCH btfs_protocol.h */
 enum {
-	BTFS_OP_GETATTR = 1,
-	BTFS_OP_READDIR = 2,
-	BTFS_OP_OPEN = 10,
-	BTFS_OP_READ = 11,
-	BTFS_OP_WRITE = 12,
-	BTFS_OP_CLOSE = 13,
-	BTFS_OP_FSYNC = 14,
-	BTFS_OP_MKDIR = 20,
-	BTFS_OP_RMDIR = 21,
-	BTFS_OP_CREATE = 30,
-	BTFS_OP_UNLINK = 31,
-	BTFS_OP_RENAME = 32,
-	BTFS_OP_TRUNCATE = 33,
+    BTFS_OP_GETATTR = 1,
+    BTFS_OP_READDIR = 2,
+    BTFS_OP_ACCESS = 3,
+    BTFS_OP_STATFS = 4,
+    BTFS_OP_OPEN = 10,
+    BTFS_OP_READ = 11,
+    BTFS_OP_WRITE = 12,
+    BTFS_OP_CLOSE = 13,
+    BTFS_OP_FSYNC = 14,
+    BTFS_OP_MKDIR = 20,
+    BTFS_OP_RMDIR = 21,
+    BTFS_OP_CREATE = 30,
+    BTFS_OP_UNLINK = 31,
+    BTFS_OP_RENAME = 32,
+    BTFS_OP_TRUNCATE = 33,
+    BTFS_OP_CHMOD = 34,
+    BTFS_OP_CHOWN = 35,
+    BTFS_OP_UTIMENS = 36,
+	BTFS_OP_SYMLINK = 37, 
+	BTFS_OP_READLINK = 38,
+    BTFS_OP_LOCK = 40,
+    BTFS_OP_UNLOCK = 41,
+    BTFS_OP_PING = 50,
+    BTFS_OP_DISCONNECT = 51
 };
 
 /* Netlink wrapper */
@@ -52,6 +64,20 @@ struct btfs_nl_msg {
 	u32 len;
 	u8 data[0];
 } __packed;
+
+struct btfs_symlink_req {
+    char target[BTFS_MAX_PATH];
+    char linkpath[BTFS_MAX_PATH];
+} __packed;
+
+struct btfs_readlink_req {
+    char path[BTFS_MAX_PATH];
+} __packed;
+
+struct btfs_readlink_resp {
+    char target[BTFS_MAX_PATH];
+} __packed;
+
 
 /* Protocol structures from btfs_protocol.h */
 struct btfs_attr {
@@ -186,7 +212,7 @@ static const struct inode_operations btfs_dir_iops;
 static const struct inode_operations btfs_file_iops;
 static const struct file_operations btfs_dir_fops;
 static const struct file_operations btfs_file_fops;
-
+static const struct inode_operations btfs_symlink_iops;
 /*
  * RPC helpers
  */
@@ -395,23 +421,26 @@ static void btfs_fill_inode(struct inode *inode, struct btfs_attr *fa)
 
 static struct inode *btfs_new_inode(struct super_block *sb, struct btfs_attr *fa)
 {
-	struct inode *inode = new_inode(sb);
-	if (!inode)
-		return NULL;
-	
-	btfs_fill_inode(inode, fa);
-	
-	if (S_ISDIR(fa->mode)) {
-		inode->i_op = &btfs_dir_iops;
-		inode->i_fop = &btfs_dir_fops;
-	} else if (S_ISREG(fa->mode)) {
-		inode->i_op = &btfs_file_iops;
-		inode->i_fop = &btfs_file_fops;
-		inode->i_data.a_ops = &empty_aops;
-	}
-	
-	return inode;
+    struct inode *inode = new_inode(sb);
+    if (!inode)
+        return NULL;
+    
+    btfs_fill_inode(inode, fa);
+    
+    if (S_ISDIR(fa->mode)) {
+        inode->i_op = &btfs_dir_iops;
+        inode->i_fop = &btfs_dir_fops;
+    } else if (S_ISREG(fa->mode)) {
+        inode->i_op = &btfs_file_iops;
+        inode->i_fop = &btfs_file_fops;
+        inode->i_data.a_ops = &empty_aops;
+    } else if (S_ISLNK(fa->mode)) {      
+        inode->i_op = &btfs_symlink_iops;
+    }                                    
+    
+    return inode;
 }
+
 
 /*
  * File operations
@@ -486,6 +515,7 @@ static int btfs_open(struct inode *inode, struct file *file)
 	return btfs_ensure_open(inode, file);
 }
 
+
 static int btfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
     struct inode *inode = file_inode(file);
@@ -511,6 +541,84 @@ static int btfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
     
     pr_info("btfs_fsync: success\n");
     return 0;
+}
+
+static int btfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+                        struct dentry *dentry, const char *target)
+{
+    struct btfs_mnt *mnt = BTFS_MNT(dir->i_sb);
+    struct btfs_symlink_req req;
+    struct inode *inode;
+    int ret;
+    
+    memset(&req, 0, sizeof(req));
+    
+    // Скопировать target (куда указывает ссылка)
+    strscpy(req.target, target, BTFS_MAX_PATH);
+    
+    // Получить путь где создать ссылку
+    ret = btfs_path(dentry, req.linkpath, BTFS_MAX_PATH);
+    if (ret)
+        return ret;
+    
+    pr_info("btfs_symlink: creating %s -> %s\n", req.linkpath, req.target);
+    
+    ret = btfs_rpc(mnt, BTFS_OP_SYMLINK, &req, sizeof(req), NULL, 0);
+    if (ret)
+        return ret;
+    
+    // Создать inode для symlink
+    inode = new_inode(dir->i_sb);
+    if (!inode)
+        return -ENOMEM;
+    
+    inode->i_ino = get_next_ino();
+    inode->i_mode = S_IFLNK | 0777;  // Symlink всегда 0777
+    inode->i_op = &btfs_symlink_iops;  // ← Новая таблица операций
+    inode_init_owner(idmap, inode, dir, S_IFLNK | 0777);
+    
+    d_instantiate(dentry, inode);
+    return 0;
+}
+
+static const char *btfs_get_link(struct dentry *dentry, struct inode *inode,
+                                  struct delayed_call *done)
+{
+    struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+    struct btfs_readlink_req req;
+    struct btfs_readlink_resp *resp;
+    char *link;
+    int ret;
+    
+    if (!dentry)
+        return ERR_PTR(-ECHILD);  // RCU lookup не поддерживается
+    
+    memset(&req, 0, sizeof(req));
+    ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+    if (ret)
+        return ERR_PTR(ret);
+    
+    resp = kmalloc(sizeof(*resp), GFP_KERNEL);
+    if (!resp)
+        return ERR_PTR(-ENOMEM);
+    
+    ret = btfs_rpc(mnt, BTFS_OP_READLINK, &req, sizeof(req), resp, sizeof(*resp));
+    if (ret) {
+        kfree(resp);
+        return ERR_PTR(ret);
+    }
+    
+    pr_info("btfs_get_link: %s -> %s\n", req.path, resp->target);
+    
+    // Скопировать результат в постоянную память
+    link = kstrdup(resp->target, GFP_KERNEL);
+    kfree(resp);
+    
+    if (!link)
+        return ERR_PTR(-ENOMEM);
+    
+    set_delayed_call(done, kfree_link, link);
+    return link;
 }
 
 
@@ -927,6 +1035,11 @@ static int btfs_rmdir(struct inode *dir, struct dentry *dentry)
 	return ret;
 }
 
+static const struct inode_operations btfs_symlink_iops = {
+    .get_link = btfs_get_link,
+    .getattr = btfs_getattr,
+};
+
 static int btfs_rename(struct mnt_idmap *idmap,
 		       struct inode *odir, struct dentry *odentry,
 		       struct inode *ndir, struct dentry *ndentry,
@@ -953,34 +1066,69 @@ static int btfs_rename(struct mnt_idmap *idmap,
 
 static int btfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
-	struct inode *inode = d_inode(dentry);
-	struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
-	struct btfs_truncate_req req;
-	int ret;
-	
-	ret = setattr_prepare(idmap, dentry, attr);
-	if (ret)
-		return ret;
-	
-	if (attr->ia_valid & ATTR_SIZE) {
-		memset(&req, 0, sizeof(req));
-		ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
-		if (ret)
-			return ret;
-		
-		req.size = attr->ia_size;
-		
-		ret = btfs_rpc(mnt, BTFS_OP_TRUNCATE, &req, sizeof(req), NULL, 0);
-		if (ret)
-			return ret;
-		
-		truncate_setsize(inode, attr->ia_size);
-	}
-	
-	setattr_copy(idmap, inode, attr);
-	mark_inode_dirty(inode);
-	return 0;
+    struct inode *inode = d_inode(dentry);
+    struct btfs_mnt *mnt = BTFS_MNT(inode->i_sb);
+    int ret;
+    
+    ret = setattr_prepare(idmap, dentry, attr);
+    if (ret)
+        return ret;
+    
+    // TRUNCATE
+    if (attr->ia_valid & ATTR_SIZE) {
+        struct btfs_truncate_req req;
+        memset(&req, 0, sizeof(req));
+        ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+        if (ret)
+            return ret;
+        req.size = attr->ia_size;
+        ret = btfs_rpc(mnt, BTFS_OP_TRUNCATE, &req, sizeof(req), NULL, 0);
+        if (ret)
+            return ret;
+        truncate_setsize(inode, attr->ia_size);
+    }
+    
+    // CHMOD
+    if (attr->ia_valid & ATTR_MODE) {
+        struct {
+            char path[BTFS_MAX_PATH];
+            u32 mode;
+        } __packed req;
+        
+        memset(&req, 0, sizeof(req));
+        ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+        if (ret)
+            return ret;
+        req.mode = attr->ia_mode;
+        ret = btfs_rpc(mnt, BTFS_OP_CHMOD, &req, sizeof(req), NULL, 0);
+        if (ret)
+            return ret;
+    }
+    
+    // CHOWN
+    if (attr->ia_valid & (ATTR_UID | ATTR_GID)) {
+        struct {
+            char path[BTFS_MAX_PATH];
+            u32 uid;
+            u32 gid;
+        } __packed req;
+        
+        memset(&req, 0, sizeof(req));
+        ret = btfs_path(dentry, req.path, BTFS_MAX_PATH);
+        if (ret)
+            return ret;
+        req.uid = from_kuid(&init_user_ns, attr->ia_uid);
+        req.gid = from_kgid(&init_user_ns, attr->ia_gid);
+        ret = btfs_rpc(mnt, BTFS_OP_CHOWN, &req, sizeof(req), NULL, 0);
+        if (ret)
+            return ret;
+    }
+    
+    setattr_copy(idmap, inode, attr);
+    mark_inode_dirty(inode);
+    return 0;
 }
+
 
 static const struct inode_operations btfs_file_iops = {
 	.getattr = btfs_getattr,
@@ -989,13 +1137,17 @@ static const struct inode_operations btfs_file_iops = {
 
 static const struct inode_operations btfs_dir_iops = {
 	.lookup = btfs_lookup,
+	.get_link = btfs_get_link,
 	.getattr = btfs_getattr,
 	.create = btfs_create,
 	.unlink = btfs_unlink,
 	.mkdir = btfs_mkdir,
 	.rmdir = btfs_rmdir,
 	.rename = btfs_rename,
+	.symlink = btfs_symlink
 };
+
+
 
 /*
  * Superblock operations
@@ -1046,12 +1198,43 @@ static void btfs_put_super(struct super_block *sb)
 	kfree(mnt);
 }
 
+static int btfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+    struct btfs_mnt *mnt = BTFS_MNT(dentry->d_sb);
+    struct {
+        u64 blocks;
+        u64 bfree;
+        u64 bavail;
+        u64 files;
+        u64 ffree;
+        u32 bsize;
+        u32 namelen;
+    } __packed resp;
+    int ret;
+    
+    ret = btfs_rpc(mnt, BTFS_OP_STATFS, NULL, 0, &resp, sizeof(resp));
+    if (ret < 0)
+        return ret;
+    
+    buf->f_type = BTFS_MAGIC;
+    buf->f_bsize = resp.bsize;
+    buf->f_blocks = resp.blocks;
+    buf->f_bfree = resp.bfree;
+    buf->f_bavail = resp.bavail;
+    buf->f_files = resp.files;
+    buf->f_ffree = resp.ffree;
+    buf->f_namelen = resp.namelen;
+    
+    return 0;
+}
+
+
 static const struct super_operations btfs_sops = {
 	.alloc_inode = btfs_alloc_inode,
 	.free_inode = btfs_free_inode,
 	.evict_inode = btfs_evict_inode,
 	.put_super = btfs_put_super,
-	.statfs = simple_statfs,
+	.statfs = btfs_statfs,
 	.drop_inode = generic_delete_inode,
 };
 

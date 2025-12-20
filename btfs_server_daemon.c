@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/statvfs.h>
 #include <dirent.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -646,6 +647,31 @@ int handle_chown(const char *rel_path, uint32_t uid, uint32_t gid)
     return chown(full_path, uid, gid) < 0 ? -errno : 0;
 }
 
+int handle_symlink(const char *target, const char *linkpath)
+{
+    char link_full[PATH_MAX];
+    if (build_full_path(link_full, sizeof(link_full), linkpath) < 0)
+        return -ENAMETOOLONG;
+
+    // symlink() создаёт символическую ссылку
+    // target может быть относительным или абсолютным
+    return symlink(target, link_full) < 0 ? -errno : 0;
+}
+
+int handle_readlink(const char *linkpath, char *buffer, size_t bufsize)
+{
+    char link_full[PATH_MAX];
+    if (build_full_path(link_full, sizeof(link_full), linkpath) < 0)
+        return -ENAMETOOLONG;
+
+    ssize_t len = readlink(link_full, buffer, bufsize - 1);
+    if (len < 0)
+        return -errno;
+
+    buffer[len] = '\0'; // readlink() НЕ добавляет null terminator
+    return 0;
+}
+
 // ============ ПРОТОКОЛ ============
 
 int send_response(int sock, uint32_t sequence, uint32_t opcode,
@@ -829,6 +855,36 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data)
                   client->client_id, req->file_handle, req->offset, req->size, bytes);
         break;
     }
+    case BTFS_OP_CHMOD:
+    {
+        typedef struct
+        {
+            char path[BTFS_MAX_PATH];
+            uint32_t mode;
+        } __attribute__((packed)) btfs_chmod_req_t;
+
+        btfs_chmod_req_t *req = (btfs_chmod_req_t *)data;
+        result = handle_chmod(req->path, req->mode);
+        print_log("[Client %u] CHMOD: %s -> mode=%o, result=%d",
+                  client->client_id, req->path, req->mode, result);
+        break;
+    }
+
+    case BTFS_OP_CHOWN:
+    {
+        typedef struct
+        {
+            char path[BTFS_MAX_PATH];
+            uint32_t uid;
+            uint32_t gid;
+        } __attribute__((packed)) btfs_chown_req_t;
+
+        btfs_chown_req_t *req = (btfs_chown_req_t *)data;
+        result = handle_chown(req->path, req->uid, req->gid);
+        print_log("[Client %u] CHOWN: %s -> uid=%u, gid=%u, result=%d",
+                  client->client_id, req->path, req->uid, req->gid, result);
+        break;
+    }
 
     case BTFS_OP_WRITE:
     {
@@ -855,6 +911,40 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data)
 
         print_log("[Client %u] WRITE: handle=%lu, offset=%lu, requested=%u, written=%zd",
                   client->client_id, req->file_handle, req->offset, req->size, bytes);
+        break;
+    }
+    case BTFS_OP_STATFS:
+    {
+        struct statvfs st;
+        if (statvfs(base_path, &st) < 0)
+        {
+            result = -errno;
+        }
+        else
+        {
+            struct
+            {
+                uint64_t blocks;
+                uint64_t bfree;
+                uint64_t bavail;
+                uint64_t files;
+                uint64_t ffree;
+                uint32_t bsize;
+                uint32_t namelen;
+            } __attribute__((packed)) resp;
+
+            resp.blocks = st.f_blocks;
+            resp.bfree = st.f_bfree;
+            resp.bavail = st.f_bavail;
+            resp.files = st.f_files;
+            resp.ffree = st.f_ffree;
+            resp.bsize = st.f_bsize;
+            resp.namelen = NAME_MAX;
+
+            response_data = &resp;
+            response_len = sizeof(resp);
+        }
+        print_log("[Client %u] STATFS -> %d", client->client_id, result);
         break;
     }
 
@@ -955,6 +1045,31 @@ void process_request(client_info_t *client, btfs_header_t *header, char *data)
         result = handle_fsync(client->client_id, req->file_handle);
         print_log("[Client %u] FSYNC: handle=%lu -> %d",
                   client->client_id, req->file_handle, result);
+        break;
+    }
+
+    case BTFS_OP_SYMLINK:
+    {
+        btfs_symlink_req_t *req = (btfs_symlink_req_t *)data;
+        result = handle_symlink(req->target, req->linkpath);
+        print_log("[Client %u] SYMLINK: %s -> %s, result=%d",
+                  client->client_id, req->linkpath, req->target, result);
+        break;
+    }
+
+    case BTFS_OP_READLINK:
+    {
+        btfs_readlink_req_t *req = (btfs_readlink_req_t *)data;
+        btfs_readlink_resp_t resp;
+        result = handle_readlink(req->path, resp.target, BTFS_MAX_PATH);
+        if (result == 0)
+        {
+            response_data = &resp;
+            response_len = sizeof(resp);
+        }
+        print_log("[Client %u] READLINK: %s -> %s, result=%d",
+                  client->client_id, req->path,
+                  result == 0 ? resp.target : "(error)", result);
         break;
     }
 

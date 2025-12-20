@@ -28,6 +28,8 @@ typedef enum {
     BTFS_OP_CHMOD = 34,
     BTFS_OP_CHOWN = 35,
     BTFS_OP_UTIMENS = 36,
+    BTFS_OP_SYMLINK = 37, 
+    BTFS_OP_READLINK = 38,
     BTFS_OP_LOCK = 40,
     BTFS_OP_UNLOCK = 41,
     BTFS_OP_PING = 50,
@@ -67,6 +69,20 @@ typedef struct {
     char path[BTFS_MAX_PATH];
     uint64_t offset;
 } __attribute__((packed)) btfs_readdir_req_t;
+
+
+typedef struct {
+    char target[BTFS_MAX_PATH];    // Куда указывает ссылка
+    char linkpath[BTFS_MAX_PATH];  // Где создать ссылку
+} __attribute__((packed)) btfs_symlink_req_t;
+
+typedef struct {
+    char path[BTFS_MAX_PATH];
+} __attribute__((packed)) btfs_readlink_req_t;
+
+typedef struct {
+    char target[BTFS_MAX_PATH];
+} __attribute__((packed)) btfs_readlink_resp_t;
 
 typedef struct {
     char path[BTFS_MAX_PATH];
