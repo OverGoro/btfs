@@ -72,8 +72,8 @@ typedef struct {
 
 
 typedef struct {
-    char target[BTFS_MAX_PATH];    // Куда указывает ссылка
-    char linkpath[BTFS_MAX_PATH];  // Где создать ссылку
+    char target[BTFS_MAX_PATH];  
+    char linkpath[BTFS_MAX_PATH];
 } __attribute__((packed)) btfs_symlink_req_t;
 
 typedef struct {
@@ -128,7 +128,6 @@ typedef struct {
     char newpath[BTFS_MAX_PATH];
 } __attribute__((packed)) btfs_rename_req_t;
 
-// ДОБАВИТЬ ЭТУ СТРУКТУРУ:
 typedef struct {
     char path[BTFS_MAX_PATH];
     uint64_t size;
@@ -146,7 +145,6 @@ typedef struct {
 } __attribute__((packed)) btfs_fsync_req_t;
 
 
-// Response structures
 typedef struct {
     uint64_t ino;
     uint64_t size;
@@ -188,4 +186,4 @@ typedef struct {
     uint32_t lock_id;
 } __attribute__((packed)) btfs_lock_resp_t;
 
-#endif // BTFS_PROTOCOL_H
+#endif
